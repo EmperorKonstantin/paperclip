@@ -158,6 +158,8 @@ import {
   type PullRequestMergeState,
 } from "./github-pull-request-merge.js";
 
+import { rejectUnattendedInteraction } from "./unattended-issue.js";
+
 export { extractGitHubPullRequestReferences } from "./github-pull-request-merge.js";
 export type { GitHubPullRequestReference } from "./github-pull-request-merge.js";
 
@@ -2906,6 +2908,7 @@ export function issueThreadInteractionService(
         idempotencyKey: string;
       },
     ) => {
+      await rejectUnattendedInteraction(db, issue, { runId: input.sourceRunId });
       const payload = connectionIntentPayloadSchema.parse(input.payload);
       const sameSavedSetup = (candidate: typeof payload) =>
         candidate.savedSetup?.endpointId === payload.savedSetup?.endpointId
@@ -3703,6 +3706,7 @@ export function issueThreadInteractionService(
       const data = normalizeCreateInteractionInput(
         createIssueThreadInteractionSchema.parse(input),
       );
+      await rejectUnattendedInteraction(db, issue, actor);
       const qualityItems = data.kind === "request_confirmation" && data.payload.qualityReview
         ? [data.payload] : data.kind === "request_item_verdicts"
           ? data.payload.items.filter(item => item.qualityReview) : [];

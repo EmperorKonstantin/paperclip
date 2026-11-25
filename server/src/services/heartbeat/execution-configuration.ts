@@ -23,6 +23,7 @@ import { PLUGIN_RUNNER_AI_CONNECTION_REQUIRED, pluginEnvironmentRunnerTaskDriver
 import { prepareConnectionInstructionDelivery } from "../connection-instructions.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "../connector-runtime.js";
 import { resolveManagedGitHubIdentitySelection } from "../git-credentials.js";
+import { githubAppProjectBinding } from "../github-app-credentials.js";
 import { resolveAssignedConnectionInstructionsForRun } from "../native-runtime/assigned-mcp-tools.js";
 import { recordFailedSkillPreparation, type NativeRunHistoricalSpan } from "../native-runtime/native-run-trace.js";
 import { collectRunFailureSecretValues } from "../run-failure-diagnostics.js";
@@ -174,7 +175,12 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
     !acceptedPlanWakeRoutingDecision?.suppressAcceptedContinuation
       ? [...runScopedMentionedSkillKeys, ACCEPTED_PLAN_CONVERSION_SKILL_KEY]
       : runScopedMentionedSkillKeys;
-  const githubSelection = githubIdentity.value;
+  const githubAppConfigured = Boolean(taskProjectContext
+    && githubAppProjectBinding(agent.companyId, taskProjectContext.id));
+  const githubSelection = {
+    ...githubIdentity.value,
+    configured: githubIdentity.value.configured || githubAppConfigured,
+  };
   const useHostGitHub =
     !githubSelection.configured &&
     trustPreset.kind === "standard" &&

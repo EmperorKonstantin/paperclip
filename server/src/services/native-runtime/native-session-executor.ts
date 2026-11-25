@@ -1,3 +1,4 @@
+import { rejectUnattendedInteraction } from "../unattended-issue.js";
 import { remoteRecoveryLeaseMismatch } from "./remote-recovery-lease-mismatch.js";
 import { isGovernancePauseStop } from "../governance-pause-stop.js";
 import { nativeLeaseHolder, notifyNativeTokenLeaseClaimed } from "./native-token-lease-settlement.js";
@@ -9279,6 +9280,7 @@ export async function executePaperclipNativeSession(input: {
   preparationSpans?: NativeRunHistoricalSpan[];
   /** Use a session-owned GitHub broker, rebound only after run ownership is acquired. */
   managedGitHub?: boolean;
+  unattended?: boolean;
   /** Resolved adapter env; the runner transport applies a provider allowlist before spawn. */
   dotWorkspaceRoot?: string;
   observability?: ProviderObservabilityLaunch;
@@ -10407,6 +10409,10 @@ async function executePaperclipNativeSessionAttempt(
         }
       },
       onCommittedEvent: async (event, cursor) => {
+        if (input.unattended && event.eventType === "runtime_request.created") {
+          const { companyId, issueId, agentId, runId } = input.execution.binding;
+          await rejectUnattendedInteraction(input.db, { id: issueId, companyId }, { agentId, runId });
+        }
         if (event.eventType === "run.result.proposed") {
           const at = Date.now();
           await trace.record({name:"completion.tool_accepted",parentName:"native.session.execute",startedAtMs:at,endedAtMs:at});

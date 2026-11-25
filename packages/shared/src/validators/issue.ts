@@ -459,6 +459,7 @@ export const requiredQualityReviewSchema = z.object({
 });
 
 export const issueExecutionPolicySchema = z.object({
+  unattended: z.boolean().optional(),
   requiredQualityReview: requiredQualityReviewSchema.optional(),
   mode: z.enum(ISSUE_EXECUTION_POLICY_MODES).optional().default("normal"),
   commentRequired: z.boolean().optional().default(true),

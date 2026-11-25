@@ -788,6 +788,7 @@ export interface QualityReviewBinding {
 }
 
 export interface IssueExecutionPolicy {
+  unattended?: boolean;
   mode: IssueExecutionPolicyMode;
   requiredQualityReview?: RequiredQualityReview;
   commentRequired: boolean;

@@ -1,3 +1,4 @@
+import { assertNoUnattendedInputRequest } from "../unattended-issue.js";
 import { readClaimedNativeStopRecovery } from "../native-runtime/native-cancellation-request.js";
 import { readContextCompactionRequest } from "../context-compaction.js";
 import { remoteWorkspaceFailureCause } from "../remote-workspace-transport.js";
@@ -684,6 +685,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               // configured provider values and the server-selected
               // workspace boundary authoritative.
               managedGitHub: !useHostGitHub && githubSelection.configured,
+              unattended: issueContext?.executionPolicy?.unattended,
               billingIdentity: managedAiRuntime ? { provider: managedAiRuntime.attribution.provider, biller: managedAiRuntime.attribution.provider === "openai" ? resolveManagedOpenAiBilling(managedAiRuntime.config.managedAiRouting)?.biller ?? managedAiRuntime.attribution.provider : managedAiRuntime.attribution.provider, billingType: managedAiRuntime.attribution.method === "subscription" ? "subscription_included" : "metered_api" } : undefined,
               managedAiCredentialIdentity: managedAiRuntime?.identity,
               managedAiAccountIdentity: managedAiRuntime?.sessionIdentity,
@@ -941,6 +943,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       if (!guardedDispatch.dispatched) return { dispatched: false };
       adapterResult = await guardedDispatch.resultPromise;
     }
+    if (issueContext?.executionPolicy?.unattended) await assertNoUnattendedInputRequest(db, run.companyId, run.id);
     adapterResult = identityRedactor.redact(adapterResult);
     if (run.runtimeMode === "legacy" && hasWorkspaceRestoreFailure(adapterResult.resultJson)
         && executionTarget?.kind === "remote" && executionTarget.transport === "sandbox") {

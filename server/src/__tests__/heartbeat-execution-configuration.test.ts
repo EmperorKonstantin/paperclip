@@ -13,6 +13,7 @@ import { withSkillVersionCacheLock } from "../services/skill-version-cache.js";
 import { registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
 import { HttpError } from "../errors.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { bindHeartbeatRunnerHomeMode, prepareHeartbeatExecutionConfiguration, type HeartbeatExecutionConfigurationInput } from "../services/heartbeat/execution-configuration.js";
 import { buildEffectiveRunSessionConfigMetadata, resolveTaskSessionConfigFreshness } from "../services/heartbeat/workspaces.js";
 import { aiConnectionBindingSchema, type Environment } from "@paperclipai/shared";
@@ -173,7 +174,7 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
       runtimeConfig: account ? { aiConnection: { provider: "openai", method: "api_key", mode: "delegated", connectionId: account.connectionId, grantId: account.grantId } } : {},
     });
     await db.insert(issues).values({ id: issueId, companyId, projectId, title: "Configuration fixture", status: "todo", assigneeAgentId: agentId, responsibleUserId: userId, issueNumber: 1, assigneeAdapterOverrides: { adapterConfig: { model: "issue-model" } } });
-    return { companyId, agentId, issueId, userId, credential };
+    return { companyId, agentId, issueId, projectId, userId, credential };
   }
 
   async function execute(f: Awaited<ReturnType<typeof seed>>) {
@@ -343,7 +344,7 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
       run, agent,
       task: { issueId: f.issueId, context: { ...snapshot, issueId: f.issueId }, responsibleUserId: null, pinnedSkillTest,
         acceptedPlanContinuationWake: false, acceptedPlanWakeRoutingDecision: null,
-        taskProjectContext: null, routineEnvContext: { routineId: null, env: null, responsibleUserId: null } },
+        taskProjectContext: { id: f.projectId, env: null }, routineEnvContext: { routineId: null, env: null, responsibleUserId: null } },
       config: { sourceWorkspaceConfig: config, aiBinding: undefined },
       policy: { trustPreset: { kind: "standard", preset: "standard", boundary: null, sourcePresets: {} }, useIsolatedTaskDirectory: false, explicitTaskDirectory, requestedExecutionWorkspaceMode },
       environment: { selectedEnvironmentId: environment.id, selectedEnvironmentForConfig: environment,
@@ -352,6 +353,49 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
       onFailureSecretsResolved: () => {}, onManagedAiRuntimeAcquired: () => {}, onIdentityRedactorPrepared: () => {},
     }) };
   }
+
+  it("fails an unattended task that tries to ask a dashboard question", async () => {
+    const f = await seed();
+    await db.update(issues).set({ executionPolicy: { unattended: true, mode: "normal", commentRequired: true, stages: [] } })
+      .where(eq(issues.id, f.issueId));
+    const interactions = issueThreadInteractionService(db);
+    inspect.set(f.agentId, async ({ runId }) => {
+      await expect(interactions.create({ id: f.issueId, companyId: f.companyId }, {
+        kind: "ask_user_questions",
+        sourceRunId: runId,
+        payload: { version: 1, questions: [{
+          id: "choice", prompt: "How should I proceed?", required: true, selectionMode: "single",
+          options: [{ id: "answer", label: "Enter an answer", freeText: true }],
+        }] },
+      }, { agentId: f.agentId, runId })).rejects.toThrow("This unattended task requires human input.");
+    });
+    try {
+      const { finished } = await execute(f);
+      expect(finished.status).toBe("failed");
+      expect(finished.error).toContain("This unattended task requires human input.");
+      expect(await interactions.listForIssue(f.issueId)).toEqual([]);
+    } finally {
+      inspect.delete(f.agentId);
+    }
+  });
+
+  it("enables scoped GitHub credentials for an App-bound project without a managed connection", async () => {
+    const bound = await seed();
+    const other = await seed();
+    vi.stubEnv("PAPERCLIP_GITHUB_APP_PROJECTS", JSON.stringify([{
+      companyId: bound.companyId, projectId: bound.projectId, workspaceId: randomUUID(),
+      repositoryId: "123", agentIds: [bound.agentId],
+    }]));
+
+    const selected = await configuration(bound, {}, {}, "codex_local");
+    expect(await selected.prepare()).toMatchObject({
+      prepared: true, githubSelection: { configured: true }, useHostGitHub: false,
+    });
+    const unselected = await configuration(other, {}, {}, "codex_local");
+    expect(await unselected.prepare()).toMatchObject({
+      prepared: true, githubSelection: { configured: false }, useHostGitHub: true,
+    });
+  });
 
   it("delivers the Studio pin instead of ordinary assignments and recovers that exact native selection", async () => {
     const f = await seed(), skills = companySkillService(db);
