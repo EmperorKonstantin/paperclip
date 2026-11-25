@@ -3,7 +3,14 @@ import { createHash } from "node:crypto";
 /** This contract deliberately has no narrative, liveness label or progress count. */
 export interface LegacyContinuationInput {
   run: { id: string; companyId: string; agentId: string; status: string; runtimeMode?: string | null };
-  issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null; assigneeUserId?: string | null } | null;
+  issue: {
+    id: string;
+    companyId: string;
+    status: string;
+    assigneeAgentId: string | null;
+    assigneeUserId?: string | null;
+    executionPolicy?: Record<string, unknown> | null;
+  } | null;
   agent: { id: string; companyId: string; status: string } | null;
   episode: LegacyDispositionEpisode;
   gates: {
@@ -28,6 +35,20 @@ export const LEGACY_DISPOSITION_REPAIR_INSTRUCTION =
   "Re-read the current task state. Use Paperclip tools/API to record completion, a real blocker, " +
   "a question or approval request, or a supported next execution path. " +
   "A final message alone does not record disposition. Respect Stop, pause, budget and approval gates.";
+
+const UNATTENDED_LEGACY_DISPOSITION_REPAIR_INSTRUCTION =
+  "The previous run ended before recording a result for this unattended assignment. " +
+  "Read the approved scope and inspect the existing workspace, then resume the remaining implementation and verification in this run. " +
+  "When the deliverable is ready, record it and complete the issue through Paperclip. " +
+  "If a specific blocker prevents further work, record the blocker and mark the issue blocked. " +
+  "Do not open a dashboard question or approval request, resolve the recovery record yourself, or return the task to todo with only a summary. " +
+  "Respect Stop, pause, budget and approval gates.";
+
+export function legacyDispositionRepairInstruction(policy: Record<string, unknown> | null | undefined) {
+  return policy?.unattended === true
+    ? UNATTENDED_LEGACY_DISPOSITION_REPAIR_INSTRUCTION
+    : LEGACY_DISPOSITION_REPAIR_INSTRUCTION;
+}
 
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -81,6 +102,6 @@ export function decideLegacyContinuation(input: LegacyContinuationInput):
   return {
     kind: "enqueue", nextAttempt,
     idempotencyKey: `issue_disposition_repair:${issue.id}:${legacyDispositionFingerprint(run.companyId, issue.id, run.agentId, episode.id)}:${nextAttempt}`,
-    instruction: LEGACY_DISPOSITION_REPAIR_INSTRUCTION,
+    instruction: legacyDispositionRepairInstruction(issue.executionPolicy),
   };
 }

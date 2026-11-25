@@ -6915,9 +6915,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(mockCaptureRunFailure.mock.calls.filter(([event]) => event.runId === runId)).toEqual([]);
   });
 
-  it("queues one finish-handoff wake when a successful run leaves in-progress work without a next action", async () => {
+  it.each([false, true])("queues one finish-handoff wake for unfinished work (unattended=%s)", async (unattended) => {
     const { companyId, agentId, runId, issueId } =
       await seedQueuedIssueRunFixture();
+    if (unattended) {
+      await db.update(issues).set({ executionPolicy: { mode: "normal", stages: [], unattended: true } })
+        .where(eq(issues.id, issueId));
+    }
     mockAdapterExecute.mockImplementationOnce(
       async (ctx: { runId: string }) => {
         await db.insert(issueComments).values({
@@ -6953,7 +6957,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const repair = await heartbeat.getRun(repairs[0].runId!);
     expect(repair?.contextSnapshot).toMatchObject({
       legacyDispositionEpisode: { id: runId, attempt: 1, maxAttempts: 2 },
-      dispositionRepairInstruction: LEGACY_DISPOSITION_REPAIR_INSTRUCTION,
+      dispositionRepairInstruction: unattended
+        ? expect.stringContaining("resume the remaining implementation and verification in this run")
+        : LEGACY_DISPOSITION_REPAIR_INSTRUCTION,
     });
     expect({ status: repair?.status, errorCode: repair?.errorCode, error: repair?.error })
       .toEqual({ status: "succeeded", errorCode: null, error: null });
