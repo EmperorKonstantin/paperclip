@@ -6,6 +6,7 @@ import {
   heartbeatRuns,
   issues,
   projects,
+  projectWorkspaces,
   runIdentityContexts,
   type Db,
 } from "@paperclipai/db";
@@ -16,6 +17,9 @@ import {
   resolveManagedGitHubCredential,
 } from "./git-credentials.js";
 import { secretService } from "./secrets.js";
+import { githubAppProjectBinding, scopedGitHubAppCredential } from "./github-app-credentials.js";
+import { normalizeProjectRepositoryUrl } from "./project-repositories.js";
+import { assertTaskWorkspaceExecutionAccess } from "./task-workspace-access.js";
 import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
 import { isLowTrustQuarantined } from "./source-trust.js";
 
@@ -148,6 +152,17 @@ export async function resolveGitHubOperationCredentials(
     };
   }
   try {
+    const appToken = process.env.PAPERCLIP_GITHUB_APP_PROJECTS
+      ? await resolveGitHubAppRunToken(db, input, run, context)
+      : undefined;
+    if (appToken) {
+      summary = { status: "available", source: "dedicated", authenticationMode: "managed" };
+      await saveGitHubSummary(db, context, summary);
+      return {
+        identityContextId: context.id, revision: context.revision, ...summary,
+        env: buildGitAuthInvocation({ token: appToken, source: "managed_connection", secretName: null }).env,
+      };
+    }
     const resolved = await resolveManagedGitHubCredential(
       db,
       secretService(db),
@@ -197,4 +212,39 @@ export async function resolveGitHubOperationCredentials(
     ...summary,
     env,
   };
+}
+
+async function resolveGitHubAppRunToken(db: Db, input: { companyId: string; agentId: string; runId: string },
+  run: typeof heartbeatRuns.$inferSelect, context: RunIdentityContext) {
+  const issueId = run.issueId ?? run.nativeIssueId ?? run.contextSnapshot?.issueId ?? run.contextSnapshot?.taskId;
+  if (typeof issueId !== "string" || !isUuidLike(issueId)) return undefined;
+  const [issue] = await db.select({ projectId: issues.projectId, assigneeAgentId: issues.assigneeAgentId,
+    executionWorkspaceId: issues.executionWorkspaceId }).from(issues)
+    .where(and(eq(issues.companyId, input.companyId), eq(issues.id, issueId)));
+  if (!issue?.projectId) return undefined;
+  const binding = githubAppProjectBinding(input.companyId, issue.projectId);
+  if (!binding) return undefined;
+  const [project] = await db.select({ visibility: projects.visibility, archivedAt: projects.archivedAt }).from(projects)
+    .where(and(eq(projects.companyId, input.companyId), eq(projects.id, binding.projectId)));
+  if (issue.assigneeAgentId !== input.agentId || !project || project.archivedAt || project.visibility !== "private") {
+    throw forbidden("GitHub App credentials require the assigned agent on an active private project");
+  }
+  const [workspace] = await db.select({ repoUrl: projectWorkspaces.repoUrl }).from(projectWorkspaces)
+    .where(and(eq(projectWorkspaces.companyId, input.companyId), eq(projectWorkspaces.projectId, issue.projectId),
+      eq(projectWorkspaces.id, binding.workspaceId)));
+  if (!workspace?.repoUrl) throw forbidden("GitHub App credentials require the approved workspace");
+  await assertTaskWorkspaceExecutionAccess(db, {
+    type: "agent", source: "agent_jwt", companyId: input.companyId, agentId: input.agentId, runId: input.runId,
+    onBehalfOfUserId: run.responsibleUserId === "local-board" ? null : run.responsibleUserId,
+  }, input.companyId, { issueId, workspaceId: issue.executionWorkspaceId, projectWorkspaceId: binding.workspaceId });
+  const token = await scopedGitHubAppCredential(db, {
+    operation: "write", ...input, issueId, projectId: issue.projectId, workspaceId: binding.workspaceId,
+    repositoryId: binding.repositoryId, repository: normalizeProjectRepositoryUrl(workspace.repoUrl).fullName,
+  });
+  const latest = await captureRunIdentity(db, input, { readScope: "github_credentials" });
+  if (latest.context?.id !== context.id || latest.context.revision !== context.revision
+    || !(await allowsGitHubCredentialExport(db, latest.run))) {
+    throw forbidden("GitHub App authorization changed during credential acquisition");
+  }
+  return token;
 }

@@ -50,6 +50,54 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       const request = { companyId: input.companyId, projectId: project.id, workspaceId: workspace.id };
       return { input, selected, project, workspace, service, request, scope: { projectId: project.id } };
     }
+    it("gets a read-only GitHub App checkout credential for the bound private workspace", async () => {
+      const f = await projectAuthorizationFixture();
+      await db.update(issues).set({ assigneeAgentId: f.input.agentId }).where(eq(issues.id, f.input.issueId));
+      await db.update(projects).set({ visibility: "private" }).where(eq(projects.id, f.project.id));
+      await db.update(projectWorkspaces).set({ metadata: { githubRepositoryId: "1", githubRepositoryPrivate: true } })
+        .where(eq(projectWorkspaces.id, f.workspace.id));
+      await db.insert(projectAccessMembers).values([
+        { companyId: f.input.companyId, projectId: f.project.id, subjectType: "user", subjectId: "A" },
+        { companyId: f.input.companyId, projectId: f.project.id, subjectType: "agent", subjectId: f.input.agentId },
+      ]);
+      const config = {
+        PAPERCLIP_GITHUB_APP_PROJECTS: process.env.PAPERCLIP_GITHUB_APP_PROJECTS,
+        PAPERCLIP_GITHUB_APP_CREDENTIAL_URL: process.env.PAPERCLIP_GITHUB_APP_CREDENTIAL_URL,
+        PAPERCLIP_GITHUB_APP_SERVICE_TOKEN: process.env.PAPERCLIP_GITHUB_APP_SERVICE_TOKEN,
+      };
+      process.env.PAPERCLIP_GITHUB_APP_PROJECTS = JSON.stringify([{ ...f.request, repositoryId: "1", agentIds: [f.input.agentId] }]);
+      process.env.PAPERCLIP_GITHUB_APP_CREDENTIAL_URL = "https://credential-source.example/installation";
+      process.env.PAPERCLIP_GITHUB_APP_SERVICE_TOKEN = "a".repeat(32);
+      const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+        const scope = JSON.parse(String(init?.body));
+
+        return Response.json({ scope, token: "ghs_fixture", expiresAt: new Date(Date.now() + 10_000).toISOString() });
+      });
+      try {
+        const scope = { ...f.scope, workspaceId: f.workspace.id, operation: "prepare" as const };
+        await expect(f.service.resolve(f.request, scope)).resolves.toBe("ghs_fixture");
+        const foreground = { ...scope, runId: f.input.runId, agentId: f.input.agentId };
+        const credential = await f.service.resolve(f.request, foreground).catch(() => undefined);
+        const normal = { ...f.request, repositoryId: "1", repository: "fixture/project" };
+        expect(fetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body)))).toEqual([
+          { ...normal, operation: "checkout" },
+          { ...normal, operation: "write", agentId: f.input.agentId, issueId: f.input.issueId, runId: f.input.runId },
+        ]);
+        expect(credential).toBe("ghs_fixture");
+        await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.input.runId));
+        await expect(f.service.resolve(f.request, foreground)).rejects.toThrow();
+        await expect(f.service.resolve(f.request, { ...scope, workspaceId: randomUUID() })).rejects.toThrow();
+        await db.update(projectWorkspaces).set({ metadata: { githubRepositoryId: "2", githubRepositoryPrivate: true } })
+          .where(eq(projectWorkspaces.id, f.workspace.id));
+        await expect(f.service.resolve(f.request, scope)).rejects.toThrow("approved repository");
+        expect(fetch).toHaveBeenCalledTimes(2);
+      } finally {
+        fetch.mockRestore();
+        for (const [key, value] of Object.entries(config)) {
+          if (value === undefined) delete process.env[key]; else process.env[key] = value;
+        }
+      }
+    });
     it("uses project consent for private delivery checks and rechecks revocation without a task", async () => {
       const f = await projectAuthorizationFixture();
       await f.service.set(f.input.companyId, f.project.id, "A", f.selected.id);

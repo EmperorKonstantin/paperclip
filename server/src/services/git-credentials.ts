@@ -13,6 +13,7 @@ import {
 import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { isGitHubDotCom } from "./github-fetch.js";
 import { secretService } from "./secrets.js";
+import { githubAppTaskCheckout } from "./github-app-credentials.js";
 import { toolAccessService } from "./tool-access.js";
 
 /**
@@ -327,6 +328,10 @@ export function createGitRemoteAuthProvider(
 
   return async (remoteUrl: string) => {
     if (!isSupportedGitHubRemoteUrl(remoteUrl)) return null;
+    if (db && context?.issueId && env.PAPERCLIP_GITHUB_APP_PROJECTS) {
+      const token = await githubAppTaskCheckout(db, companyId, context.issueId, context.agentId, remoteUrl, env);
+      if (token) return buildGitAuthInvocation({ token, source: "managed_connection", secretName: null });
+    }
     if (db && context?.heartbeatRunId && context.agentId) {
       const [run] = await db.select({ contextId: heartbeatRuns.activeIdentityContextId }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, context.heartbeatRunId), eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, context.agentId),

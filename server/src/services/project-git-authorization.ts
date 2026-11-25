@@ -13,6 +13,7 @@ import {
 import type { ProjectGitAuthorization } from "@paperclipai/shared";
 import { forbidden, notFound } from "../errors.js";
 import { resolveManagedGitHubCredential } from "./git-credentials.js";
+import { githubAppProjectBinding, scopedGitHubAppCredential } from "./github-app-credentials.js";
 import { resolveGitHubOperationCredentials } from "./github-operation-credentials.js";
 import { normalizeProjectRepositoryUrl, projectRepositoryIsPrivate } from "./project-repositories.js";
 import { recordProjectLifecycleEvent } from "./resource-lifecycle-events.js";
@@ -213,6 +214,17 @@ export function projectGitAuthorizationService(db: Db) {
         });
         if (result.status !== "available") throw forbidden(result.reason ?? "Run GitHub authorization unavailable");
         return transientGitToken(result.env.PAPERCLIP_GIT_TOKEN);
+      }
+      const appBinding = githubAppProjectBinding(input.companyId, input.projectId);
+      if (appBinding) {
+        if (scope.workspaceId !== workspace.id || row.archivedAt || row.visibility !== "private"
+          || resolveCoreTrustPreset({ companyId: input.companyId, workspaceSourceProject: row }).kind !== "standard") {
+          throw forbidden("GitHub App credentials require an authorized private project workspace");
+        }
+        return transientGitToken(await scopedGitHubAppCredential(db, {
+          operation: "checkout", companyId: input.companyId, projectId: input.projectId,
+          workspaceId: workspace.id, repositoryId: appBinding.repositoryId, repository: repo.fullName,
+        }));
       }
       if (!isPrivate) return null;
       if (!row.gitAuthorizationGrantId)
