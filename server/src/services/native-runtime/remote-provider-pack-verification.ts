@@ -46,6 +46,11 @@ async function withProviderPackCheck<T>(step: "pack" | "opencode", verify: () =>
 
 export type ProviderPackInstallation = { root: string; manifest: unknown; immutable: boolean };
 export type PackProvider = { kind: "opencode" } | { kind: "acpx"; agent: string };
+export type AdmittedProviderPackReceipt = {
+  providerPackDigest: string;
+  opencodeProxySha256: string;
+  sourceRevision: string;
+};
 
 /** Admission of a build-qualified, OS-protected installation. Source revisions,
  * dependency pins and unrelated provider changes are provenance, not an interface.
@@ -57,16 +62,23 @@ export type PackProvider = { kind: "opencode" } | { kind: "acpx"; agent: string 
 function compatibleInstallation<T extends ProviderPackIdentity>(
   installation: ProviderPackInstallation, expected: T, packRoot: string,
   provider: PackProvider, requireExactIdentity: boolean, requireCurrentOpenCodeProxy: boolean,
+  admittedReceipt?: AdmittedProviderPackReceipt,
 ): T {
   const actual = installation.manifest as T | null;
   const payload = actual?.payload;
   const contract = expected.payload.compatibility?.[provider.kind];
+  const pinnedReceipt = requireExactIdentity ? admittedReceipt : undefined;
+  const matchesPinnedReceipt = pinnedReceipt !== undefined
+    && actual?.digest === pinnedReceipt.providerPackDigest
+    && payload?.artifacts?.opencodeProxy?.sha256 === pinnedReceipt.opencodeProxySha256
+    && payload?.runnerSourceRevision === pinnedReceipt.sourceRevision;
   const failed = !installation.immutable ? "installation_unprotected"
     : installation.root !== packRoot ? "installation_root"
     : !payload ? "manifest_missing"
     : actual.schema !== expected.schema ? "schema"
     : actual.digest !== `sha256:${createHash("sha256").update(canonicalProviderPackJson(payload)).digest("hex")}` ? "manifest_digest"
     : canonicalProviderPackJson(payload.target) !== canonicalProviderPackJson(expected.payload.target) ? "target"
+    : pinnedReceipt ? (!matchesPinnedReceipt ? "exact_identity" : null)
     : requireExactIdentity ? (actual.digest !== expected.digest ? "exact_identity" : null)
     : !Number.isSafeInteger(contract) || contract! < 1 ? "expected_compatibility_missing"
     : payload.compatibility?.[provider.kind] !== contract ? "compatibility_revision"
@@ -94,11 +106,16 @@ function compatibleInstallation<T extends ProviderPackIdentity>(
     const currentProfile = expected.payload.acpxProfileDigests?.[agent];
     const selected = expected.payload.providers?.[agent] ?? expected.payload.candidateProviders?.[agent];
     const installed = payload.providers?.[agent] ?? payload.candidateProviders?.[agent];
-    // ACPX's existing qualified launch profiles remain authoritative for the
-    // selected agent. Other providers in the same pack do not invalidate it.
-    if (currentProfile ? payload.acpxProfileDigests?.[agent] !== currentProfile
+    if (pinnedReceipt) {
+      const installedProfile = payload.acpxProfileDigests?.[agent];
+      if (!/^sha256:[a-f0-9]{64}$/.test(installedProfile ?? "") && !installed) {
+        throw providerPackIncompatible("acpx_profile", "selected ACPX provider profile is incompatible");
+      }
+    } else if (currentProfile ? payload.acpxProfileDigests?.[agent] !== currentProfile
       : !selected || !installed || ["version", "profileDigest", "closureDigest", "qualification", "path"].some(key =>
           (installed as Record<string, unknown>)[key] !== (selected as Record<string, unknown>)[key])) {
+      // ACPX's existing qualified launch profiles remain authoritative for the
+      // selected agent. Other providers in the same pack do not invalidate it.
       throw providerPackIncompatible("acpx_profile", "selected ACPX provider profile is incompatible");
     }
   }
@@ -134,7 +151,7 @@ function sealKeyFor(seal: { targetKey: string } | undefined, packRoot: string, m
 
 const reportedIdentity = (stdout: string) => /paperclip-pack-identity=([a-f0-9]{64})/.exec(stdout)?.[1] ?? null;
 
-export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({ runner, cwd, packRoot, manifest, installation, provider, requireExactIdentity = false, requireCurrentOpenCodeProxy = false, acceptProvenance = false, seal }: {
+export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({ runner, cwd, packRoot, manifest, installation, provider, requireExactIdentity = false, requireCurrentOpenCodeProxy = false, acceptProvenance = false, admittedReceipt, seal }: {
   runner: CommandManagedRuntimeRunner;
   cwd: string;
   packRoot: string;
@@ -144,6 +161,7 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
   requireExactIdentity?: boolean;
   requireCurrentOpenCodeProxy?: boolean;
   acceptProvenance?: boolean;
+  admittedReceipt?: AdmittedProviderPackReceipt;
   /**
    * The exact sandbox this pack sits on. After one full verification the
    * server keeps the pack's kernel identity; later runs on the same sandbox
@@ -153,7 +171,7 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
 }): Promise<T> {
   if (installation) {
     if (!provider) throw new Error("runner_remote_provider_artifact_incompatible: provider interface is required");
-    return compatibleInstallation(installation, manifest, packRoot, provider, requireExactIdentity, requireCurrentOpenCodeProxy);
+    return compatibleInstallation(installation, manifest, packRoot, provider, requireExactIdentity, requireCurrentOpenCodeProxy, admittedReceipt);
   }
   const providerNodeCommand = posix.join(
     packRoot,
