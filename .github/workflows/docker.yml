@@ -287,7 +287,7 @@ jobs:
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=sha
+            type=raw,value=docker-cache-probe-${{ github.sha }}
             type=raw,value=untzr,enable=${{ github.repository == 'EmperorKonstantin/paperclip' && github.ref == 'refs/heads/untzr' }}
             type=raw,value=sha-${{ github.sha }},enable=${{ github.repository == 'paperclipai/paperclip' && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
           labels: |
@@ -319,8 +319,8 @@ jobs:
           #
           # Per-arch refs now the legs are separate runners: a shared ref would
           # have each leg overwrite the other's cache on every build.
-          cache-from: type=registry,ref=${{ env.IMAGE_REPOSITORY }}:buildcache-${{ matrix.arch }}
-          cache-to: type=registry,ref=${{ env.IMAGE_REPOSITORY }}:buildcache-${{ matrix.arch }},mode=max
+          cache-from: type=registry,ref=${{ env.IMAGE_REPOSITORY }}:buildcache-untzr-probe-d293c343-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.IMAGE_REPOSITORY }}:buildcache-untzr-probe-d293c343-${{ matrix.arch }},mode=max
           labels: ${{ steps.meta.outputs.labels }}
 
       # The digest is the only thing `merge` needs from this job. Carried as an
@@ -432,7 +432,7 @@ jobs:
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=sha
+            type=raw,value=docker-cache-probe-${{ github.sha }}
             type=raw,value=untzr,enable=${{ github.repository == 'EmperorKonstantin/paperclip' && github.ref == 'refs/heads/untzr' }}
             type=raw,value=sha-${{ github.sha }},enable=${{ github.repository == 'paperclipai/paperclip' && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
           labels: |
@@ -481,6 +481,26 @@ jobs:
           test -n "$image"
           echo "Verifying orphan reaping in $image"
           docker run --rm -i --pull always "$image" sh -s < scripts/assert-orphan-reaping.sh
+
+      - name: Verify application build metadata and pnpm module resolution
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          image="$(printf '%s\n' "$IMAGE_TAGS" | head -n 1)"
+          version="$(git describe --tags --match 'v*' --long --dirty 2>/dev/null || true)"
+          docker run --rm --entrypoint node -e EXPECTED_SHA="$GITHUB_SHA" -e EXPECTED_VERSION="$version" "$image" -e '
+            const assert = require("node:assert/strict");
+            const fs = require("node:fs");
+            const { createRequire } = require("node:module");
+            assert.equal(process.env.PAPERCLIP_BUILD_COMMIT, process.env.EXPECTED_SHA);
+            assert.equal(process.env.PAPERCLIP_BUILD_VERSION, process.env.EXPECTED_VERSION);
+            assert.equal(require("/app/server/dist/build-info.json").commit, process.env.EXPECTED_SHA);
+            fs.accessSync("/app/server/dist-runtime/index.mjs");
+            fs.accessSync("/app/ui/dist/index.html");
+            createRequire("/app/server/dist-runtime/index.mjs").resolve("express");
+            createRequire("/app/server/dist-runtime/index.mjs").resolve("@paperclipai/db");
+          '
 
       # This generic contract is useful to any downstream image composer. Only
       # canonical master pushes own the full-SHA tag and its signed provenance.
