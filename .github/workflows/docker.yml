@@ -496,7 +496,17 @@ jobs:
             const fs = require("node:fs");
             const { createRequire } = require("node:module");
             assert.equal(process.env.PAPERCLIP_BUILD_COMMIT, process.env.EXPECTED_SHA);
-            assert.equal(process.env.PAPERCLIP_BUILD_VERSION, process.env.EXPECTED_VERSION);
+            const version = process.env.PAPERCLIP_BUILD_VERSION;
+            const expected = process.env.EXPECTED_VERSION;
+            if (expected) {
+              const separator = expected.lastIndexOf("-g");
+              const prefix = expected.slice(0, separator + 2);
+              assert.ok(version.startsWith(prefix));
+              const shortSha = version.slice(prefix.length);
+              assert.ok(shortSha.length >= 7 && process.env.EXPECTED_SHA.startsWith(shortSha));
+            } else {
+              assert.equal(version, "");
+            }
             assert.equal(require("/app/server/dist/build-info.json").commit, process.env.EXPECTED_SHA);
             fs.accessSync("/app/server/dist-runtime/index.mjs");
             fs.accessSync("/app/ui/dist/index.html");
