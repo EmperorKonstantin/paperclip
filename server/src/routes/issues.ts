@@ -14372,7 +14372,12 @@ export function issueRoutes(
   router.patch(
     "/issues/:id",
     (req, _res, next) => {
-      if (req.body?.expectedStatusVersion !== undefined && (
+      if (req.body?.expectedCompletedAssignee !== undefined) {
+        if (req.body.expectedStatusVersion === undefined || req.body.assigneeAgentId !== null ||
+            Object.keys(req.body).some(key => !["assigneeAgentId", "expectedStatusVersion", "expectedCompletedAssignee"].includes(key))) {
+          throw unprocessable("expectedCompletedAssignee requires a versioned assignee-only clear");
+        }
+      } else if (req.body?.expectedStatusVersion !== undefined && (
         req.body.status !== "todo" ||
         Object.keys(req.body).some(key => key !== "status" && key !== "expectedStatusVersion")
       )) {
@@ -14401,7 +14406,10 @@ export function issueRoutes(
       if (!(await assertIssueReadAllowed(req, res, existing))) return;
       await assertNativeRunKeepsOwnExecutionLock(req, existing);
       if (req.body.expectedStatusVersion !== undefined && (
-        existing.statusVersion !== req.body.expectedStatusVersion || existing.status !== "backlog"
+        existing.statusVersion !== req.body.expectedStatusVersion ||
+        (req.body.expectedCompletedAssignee !== undefined
+          ? existing.status !== "done" || existing.assigneeAgentId !== req.body.expectedCompletedAssignee || existing.assigneeUserId !== null
+          : existing.status !== "backlog")
       )) {
         throw conflict("The task status or assignment changed. Read the task again before starting work.", {
           code: "issue_status_version_changed",
@@ -14486,6 +14494,7 @@ export function issueRoutes(
         hiddenAt: hiddenAtRaw,
         expectedExecutionPolicy,
         expectedStatusVersion,
+        expectedCompletedAssignee,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         ...updateFields
       } = req.body;
@@ -15324,6 +15333,7 @@ export function issueRoutes(
         workspaceSelectionActor: req.actor,
         expectedExecutionPolicy,
         expectedStatusVersion,
+        expectedCompletedAssignee,
         actorAgentId: actor.agentId ?? null,
         actorRunId: actor.agentId ? actor.runId : null,
         actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,

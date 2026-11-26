@@ -11218,6 +11218,7 @@ export function issueService(db: Db) {
         workspaceSelectionActor?: AuthorizationActor;
         expectedExecutionPolicy?: typeof issues.$inferInsert.executionPolicy;
         expectedStatusVersion?: number;
+        expectedCompletedAssignee?: string;
         /** Defaults to `flatten` for parent changes. Board-user routes pass `allow_nested`. */
         parentDepthPolicy?: IssueParentDepthPolicy;
         /**
@@ -11310,13 +11311,20 @@ export function issueService(db: Db) {
         workspaceSelectionActor,
         expectedExecutionPolicy,
         expectedStatusVersion,
+        expectedCompletedAssignee,
         parentDepthPolicy: _parentDepthPolicy,
         expectedParentId: _expectedParentId,
         // Creation provenance never changes after create.
         originIssueId: _originIssueId,
         ...issueData
       } = data;
-      if (expectedStatusVersion !== undefined && (
+      if (expectedCompletedAssignee !== undefined) {
+        if (expectedStatusVersion === undefined || issueData.assigneeAgentId !== null ||
+            Object.keys(issueData).some(key => key !== "assigneeAgentId") ||
+            nextLabelIds !== undefined || blockedByIssueIds !== undefined || expectedExecutionPolicy !== undefined) {
+          throw unprocessable("expectedCompletedAssignee requires a versioned assignee-only clear");
+        }
+      } else if (expectedStatusVersion !== undefined && (
         issueData.status !== "todo" || Object.keys(issueData).some(key => key !== "status") ||
         nextLabelIds !== undefined || blockedByIssueIds !== undefined || expectedExecutionPolicy !== undefined
       )) {
@@ -11591,13 +11599,16 @@ export function issueService(db: Db) {
         }
         if (actorRunId) await assertNoCaseHandoffMutation(tx, actorRunId, id);
         if (expectedStatusVersion !== undefined && (
-          receiptExisting.statusVersion !== expectedStatusVersion || receiptExisting.status !== "backlog"
+          receiptExisting.statusVersion !== expectedStatusVersion ||
+          (expectedCompletedAssignee !== undefined
+            ? receiptExisting.status !== "done" || receiptExisting.assigneeAgentId !== expectedCompletedAssignee || receiptExisting.assigneeUserId !== null
+            : receiptExisting.status !== "backlog")
         )) {
           throw conflict("The task status or assignment changed. Read the task again before starting work.", {
             code: "issue_status_version_changed",
           });
         }
-        if (expectedStatusVersion !== undefined) {
+        if (expectedStatusVersion !== undefined && expectedCompletedAssignee === undefined) {
           const policy = normalizeIssueExecutionPolicy(receiptExisting.executionPolicy ?? null);
           const transition = applyIssueExecutionPolicyTransition({
             issue: receiptExisting,

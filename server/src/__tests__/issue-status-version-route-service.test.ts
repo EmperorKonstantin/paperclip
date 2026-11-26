@@ -137,6 +137,70 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(saved).toEqual(before);
   });
 
+  it("clears the current assignee from a completed issue", async () => {
+    const { app, issue } = await fixture();
+    const [completed] = await db.update(issues).set({
+      status: "done", executionPolicy: null, executionState: null,
+      monitorNextCheckAt: null, monitorWakeRequestedAt: null,
+    }).where(eq(issues.id, issue.id)).returning();
+    const response = await request(app).patch(`/api/issues/${issue.id}`).send({
+      assigneeAgentId: null,
+      expectedStatusVersion: completed!.statusVersion,
+      expectedCompletedAssignee: completed!.assigneeAgentId,
+    });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(await issueService(db).getById(issue.id)).toMatchObject({
+      status: "done", assigneeAgentId: null, statusVersion: completed!.statusVersion + 1,
+    });
+  });
+
+  it("preserves an assignee when reopening wins the transactional lock", async () => {
+    const { app, issue } = await fixture();
+    const [completed] = await db.update(issues).set({
+      status: "done", executionPolicy: null, executionState: null,
+      monitorNextCheckAt: null, monitorWakeRequestedAt: null,
+    }).where(eq(issues.id, issue.id)).returning();
+    const editDb = createDb(temporary.connectionString, { maxConnections: 1 });
+    const probeDb = createDb(temporary.connectionString, { maxConnections: 1 });
+    let release!: () => void;
+    let ready!: (pid: number) => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const lockReady = new Promise<number>((resolve) => { ready = resolve; });
+    const reopen = editDb.transaction(async (tx) => {
+      await tx.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issue.id));
+      ready((await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`))[0]!.pid);
+      await gate;
+    });
+    const holderPid = await lockReady;
+    const handoff = request(app).patch(`/api/issues/${issue.id}`).send({
+      assigneeAgentId: null,
+      expectedStatusVersion: completed!.statusVersion,
+      expectedCompletedAssignee: completed!.assigneeAgentId,
+    }).then((response) => response);
+    let waiting = false;
+    try {
+      const deadline = Date.now() + 5_000;
+      while (!waiting && Date.now() < deadline) {
+        const [row] = await probeDb.execute<{ waiting: boolean }>(sql`
+          select exists (select 1 from pg_stat_activity
+            where datname = current_database() and wait_event_type = 'Lock'
+              and ${holderPid} = any(pg_blocking_pids(pid))) as waiting
+        `);
+        waiting = row!.waiting;
+        if (!waiting) await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    } finally {
+      release();
+      await reopen;
+    }
+    const response = await handoff;
+    expect(waiting).toBe(true);
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(await issueService(db).getById(issue.id)).toMatchObject({
+      status: "in_progress", assigneeAgentId: completed!.assigneeAgentId,
+    });
+  });
+
   it("rejects stale promotion before clearing its monitor", async () => {
     const { app, issue } = await fixture();
     const response = await request(app).patch(`/api/issues/${issue.id}`).send({ status: "todo", expectedStatusVersion: issue.statusVersion + 1 });
