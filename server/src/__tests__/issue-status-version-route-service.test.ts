@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, heartbeatRuns, issueTreeHolds, issues } from "@paperclipai/db";
+import { agents, companies, createDb, executionWorkspaces, heartbeatRuns, issueTreeHolds, issues } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { agentRoutes } from "../routes/agents.js";
@@ -277,6 +277,44 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(response.status, JSON.stringify(response.body)).toBe(409);
     const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
     expect(saved).toEqual(run);
+  });
+
+  async function workflowStage() {
+    const { app, issue } = await fixture();
+    const [workspace] = await db.insert(executionWorkspaces).values({
+      companyId: issue.companyId, mode: "isolated_workspace", strategyType: "git_worktree", name: "Untzr checkout",
+    }).returning();
+    const [source] = await db.update(issues).set({
+      status: "done", assigneeAgentId: null, executionWorkspaceId: workspace!.id,
+      executionPolicy: null, executionState: null, monitorNextCheckAt: null, monitorWakeRequestedAt: null,
+    }).where(eq(issues.id, issue.id)).returning();
+    const [stage] = await db.insert(issues).values({
+      companyId: issue.companyId, title: "Review", status: "backlog", executionWorkspaceId: workspace!.id,
+    }).returning();
+    const body = { assigneeAgentId: issue.assigneeAgentId, status: "todo", expectedImplementation: {
+      issueId: source!.id, statusVersion: source!.statusVersion, workspaceId: workspace!.id,
+    } };
+    return { app, source: source!, stage: stage!, body };
+  }
+
+  it("activates an unassigned workflow stage only after the implementation releases the same checkout", async () => {
+    const { app, stage, body } = await workflowStage();
+    const response = await request(app).patch(`/api/issues/${stage.id}/activate-workflow-stage`).send(body);
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(await issueService(db).getById(stage.id)).toMatchObject({
+      status: "todo", assigneeAgentId: body.assigneeAgentId, executionWorkspaceId: stage.executionWorkspaceId,
+    });
+  });
+
+  it("preserves the backlog stage when the implementation acquires a hold at the activation boundary", async () => {
+    const { app, source, stage, body } = await workflowStage();
+    await db.insert(issueTreeHolds).values({
+      companyId: source.companyId, rootIssueId: source.id, mode: "pause", createdByActorType: "user",
+    });
+    const response = await request(app).patch(`/api/issues/${stage.id}/activate-workflow-stage`).send(body);
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "workflow_stage_handoff_changed" });
+    expect(await issueService(db).getById(stage.id)).toMatchObject({status: "backlog", assigneeAgentId: null});
   });
 
   it("rejects stale promotion before clearing its monitor", async () => {

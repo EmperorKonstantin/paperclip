@@ -975,6 +975,11 @@ export const updateIssueSchema = objectWithoutDefaults(
   .extend({
     expectedStatusVersion: z.number().int().nonnegative().optional(),
     expectedCompletedAssignee: z.string().uuid().optional(),
+    expectedImplementation: z.object({
+      issueId: z.string().uuid(),
+      statusVersion: z.number().int().nonnegative(),
+      workspaceId: z.string().uuid(),
+    }).strict().optional(),
     /** Reject a policy write if the policy changed after the caller read it. */
     expectedExecutionPolicy: z.record(z.string(), z.unknown()).optional().nullable(),
     requestDepth: issueRequestDepthInputSchema.optional(),

@@ -11219,6 +11219,7 @@ export function issueService(db: Db) {
         expectedExecutionPolicy?: typeof issues.$inferInsert.executionPolicy;
         expectedStatusVersion?: number;
         expectedCompletedAssignee?: string;
+        expectedImplementation?: { issueId: string; statusVersion: number; workspaceId: string };
         /** Defaults to `flatten` for parent changes. Board-user routes pass `allow_nested`. */
         parentDepthPolicy?: IssueParentDepthPolicy;
         /**
@@ -11312,6 +11313,7 @@ export function issueService(db: Db) {
         expectedExecutionPolicy,
         expectedStatusVersion,
         expectedCompletedAssignee,
+        expectedImplementation,
         parentDepthPolicy: _parentDepthPolicy,
         expectedParentId: _expectedParentId,
         // Creation provenance never changes after create.
@@ -11570,6 +11572,28 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        if (expectedImplementation) {
+          await tx.execute(sql`lock table issue_tree_holds, issue_approvals, approvals in share mode`);
+          const [source] = await tx.select().from(issues).where(and(
+            eq(issues.id, expectedImplementation.issueId), eq(issues.companyId, existing.companyId),
+          )).for("update");
+          const [active] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.companyId, existing.companyId),
+            or(eq(heartbeatRuns.issueId, expectedImplementation.issueId),
+               eq(heartbeatRuns.nativeIssueId, expectedImplementation.issueId)),
+            inArray(heartbeatRuns.status, ["queued", "running"]),
+          )).limit(1);
+          const [approval] = await tx.select({ id: approvals.id }).from(issueApprovals)
+            .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+            .where(and(eq(issueApprovals.companyId, existing.companyId), eq(issueApprovals.issueId, expectedImplementation.issueId),
+                       inArray(approvals.status, ["pending", "revision_requested"]))).limit(1);
+          if (!source || source.id === id || source.projectId !== existing.projectId || source.status !== "done" ||
+              source.statusVersion !== expectedImplementation.statusVersion || source.assigneeAgentId || source.assigneeUserId ||
+              source.executionWorkspaceId !== expectedImplementation.workspaceId || active || approval ||
+              await issueTreeControlService(tx as Db).getActivePauseHoldGate(existing.companyId, source.id)) {
+            throw conflict("Implementation has not released the task checkout.", { code: "workflow_stage_handoff_changed" });
+          }
+        }
         const changesPrivacy = issueData.visibility !== undefined || issueData.parentId !== undefined || issueData.projectId !== undefined;
         if (changesPrivacy) await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`issue-privacy-tree:${existing.companyId}`}, 0))`);
         if (issueData.parentId) await assertParentInCompany(tx, existing.companyId, issueData.parentId);
@@ -11592,6 +11616,11 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        if (expectedImplementation && (receiptExisting.status !== "backlog" ||
+            receiptExisting.assigneeAgentId || receiptExisting.assigneeUserId ||
+            receiptExisting.executionWorkspaceId !== expectedImplementation.workspaceId)) {
+          throw conflict("The waiting workflow stage changed before activation.", { code: "workflow_stage_handoff_changed" });
+        }
         if (issueData.executionPolicy !== undefined) assertQualityReviewPolicyMutation({ previousPolicy: receiptExisting.executionPolicy, nextPolicy: issueData.executionPolicy, actorAgentId, actorUserId });
         if ((patch.status ?? receiptExisting.status) === "done" &&
             (receiptExisting.status !== "done" || issueData.executionPolicy !== undefined)) {

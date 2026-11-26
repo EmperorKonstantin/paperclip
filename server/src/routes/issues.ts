@@ -14370,8 +14370,13 @@ export function issueRoutes(
   }
 
   router.patch(
-    "/issues/:id",
+    ["/issues/:id", "/issues/:id/activate-workflow-stage"],
     (req, _res, next) => {
+      const stage = req.path.endsWith("/activate-workflow-stage");
+      if (stage !== (req.body?.expectedImplementation !== undefined) || (stage && (
+          req.body.status !== "todo" || typeof req.body.assigneeAgentId !== "string" ||
+          Object.keys(req.body).some(key => !["assigneeAgentId", "status", "expectedImplementation"].includes(key))
+      ))) throw unprocessable("Workflow stage activation requires a guarded assignment to todo");
       if (req.body?.expectedCompletedAssignee !== undefined) {
         if (req.body.expectedStatusVersion === undefined || req.body.assigneeAgentId !== null ||
             Object.keys(req.body).some(key => !["assigneeAgentId", "expectedStatusVersion", "expectedCompletedAssignee"].includes(key))) {
@@ -14495,6 +14500,7 @@ export function issueRoutes(
         expectedExecutionPolicy,
         expectedStatusVersion,
         expectedCompletedAssignee,
+        expectedImplementation,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         ...updateFields
       } = req.body;
@@ -15334,6 +15340,7 @@ export function issueRoutes(
         expectedExecutionPolicy,
         expectedStatusVersion,
         expectedCompletedAssignee,
+        expectedImplementation,
         actorAgentId: actor.agentId ?? null,
         actorRunId: actor.agentId ? actor.runId : null,
         actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,
