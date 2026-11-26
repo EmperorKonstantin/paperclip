@@ -1,3 +1,4 @@
+// Source-only change for the Docker cache benchmark.
 import type { IdleDeadlineOwners } from "./services/idle-deadline-types.js";
 import { closeProcessRunAdmission } from "./services/heartbeat/run-admission.js";
 import { registerOwnershipReconciliationWork } from "./services/native-runtime/native-finalization-reconciler.js";
