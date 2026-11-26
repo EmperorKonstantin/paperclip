@@ -975,6 +975,7 @@ export const updateIssueSchema = objectWithoutDefaults(
   .extend({
     expectedStatusVersion: z.number().int().nonnegative().optional(),
     expectedCompletedAssignee: z.string().uuid().optional(),
+    expectedWorkflowStageVersion: z.number().int().nonnegative().optional(),
     expectedImplementation: z.object({
       issueId: z.string().uuid(),
       statusVersion: z.number().int().nonnegative(),

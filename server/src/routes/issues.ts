@@ -14417,9 +14417,14 @@ export function issueRoutes(
     ["/issues/:id", "/issues/:id/activate-workflow-stage"],
     (req, _res, next) => {
       const stage = req.path.endsWith("/activate-workflow-stage");
+      const reactivation = req.body?.expectedWorkflowStageVersion !== undefined;
+      const fields = ["assigneeAgentId", "status", "expectedImplementation",
+        ...(reactivation ? ["expectedWorkflowStageVersion", "description"] : [])];
+      if (reactivation && (!stage || req.actor.type !== "board" || req.actor.source === "mcp_oauth" ||
+          typeof req.body.description !== "string")) throw unprocessable("Guarded reactivation requires a board actor and fresh instructions");
       if (stage !== (req.body?.expectedImplementation !== undefined) || (stage && (
           req.body.status !== "todo" || typeof req.body.assigneeAgentId !== "string" ||
-          Object.keys(req.body).some(key => !["assigneeAgentId", "status", "expectedImplementation"].includes(key))
+          Object.keys(req.body).some(key => !fields.includes(key))
       ))) throw unprocessable("Workflow stage activation requires a guarded assignment to todo");
       if (req.body?.expectedCompletedAssignee !== undefined) {
         if (req.body.expectedStatusVersion === undefined || req.body.assigneeAgentId !== null ||
@@ -14545,6 +14550,7 @@ export function issueRoutes(
         expectedStatusVersion,
         expectedCompletedAssignee,
         expectedImplementation,
+        expectedWorkflowStageVersion,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         ...updateFields
       } = req.body;
@@ -15385,6 +15391,7 @@ export function issueRoutes(
         expectedStatusVersion,
         expectedCompletedAssignee,
         expectedImplementation,
+        expectedWorkflowStageVersion,
         actorAgentId: actor.agentId ?? null,
         actorRunId: actor.agentId ? actor.runId : null,
         actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,

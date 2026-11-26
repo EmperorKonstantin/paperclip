@@ -306,6 +306,33 @@ const support = await getEmbeddedPostgresTestSupport();
     });
   });
 
+  it("reopens the same released workflow stage with fresh instructions and a version guard", async () => {
+    const { app, stage, body } = await workflowStage();
+    const [released] = await db.update(issues).set({ status: "done", assigneeAgentId: body.assigneeAgentId })
+      .where(eq(issues.id, stage.id)).returning();
+    const path = `/api/issues/${stage.id}/activate-workflow-stage`;
+    const reactivation = { ...body, description: "Review the new commit", expectedWorkflowStageVersion: released!.statusVersion };
+    const response = await request(app).patch(path).send(reactivation);
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body).toMatchObject({ id: stage.id, status: "todo", description: reactivation.description,
+      assigneeAgentId: body.assigneeAgentId, executionWorkspaceId: stage.executionWorkspaceId });
+    expect((await request(app).patch(path).send(reactivation)).status).toBe(409);
+  });
+
+  it("preserves a paused stage when reactivation races with an owner hold", async () => {
+    const { app, source, stage, body } = await workflowStage();
+    const [released] = await db.update(issues).set({ status: "done", assigneeAgentId: body.assigneeAgentId })
+      .where(eq(issues.id, stage.id)).returning();
+    await db.insert(issueTreeHolds).values({
+      companyId: source.companyId, rootIssueId: stage.id, mode: "pause", createdByActorType: "user",
+    });
+    const response = await request(app).patch(`/api/issues/${stage.id}/activate-workflow-stage`).send({
+      ...body, description: "Review the new commit", expectedWorkflowStageVersion: released!.statusVersion,
+    });
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(await issueService(db).getById(stage.id)).toMatchObject({ status: "done", description: released!.description });
+  });
+
   it("preserves the backlog stage when the implementation acquires a hold at the activation boundary", async () => {
     const { app, source, stage, body } = await workflowStage();
     await db.insert(issueTreeHolds).values({
