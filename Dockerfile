@@ -131,7 +131,7 @@ RUN find runner protocol -type f -exec touch -d @0 {} + \
 
 FROM runner-build AS build
 WORKDIR /app
-COPY --from=deps /app /app
+COPY --link --from=deps /app /app
 COPY . .
 RUN find packages/paperclip-runner/runner packages/paperclip-runner/protocol -type f -exec touch -d @0 {} + \
   && touch -d @0 packages/paperclip-runner/rust-toolchain.toml packages/paperclip-runner/acpx-profiles.json packages/paperclip-runner/antigravity-distributions.json
@@ -171,7 +171,8 @@ RUN mkdir -p /provider-pack /provider-pack-transport \
       && mv /provider-pack.archives /provider-pack.archive.json /provider-pack-transport/; \
   else \
     echo "Skipping remote provider pack: supply a full PAPERCLIP_BUILD_COMMIT to enable remote OpenCode/ACPX execution"; \
-  fi
+  fi \
+  && chmod -R a+rX /provider-pack
 
 FROM base AS production
 ARG USER_UID=1000
@@ -200,19 +201,21 @@ RUN just --version && uv --version
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-COPY --chown=node:node --from=build /app /app
-
-COPY --chown=0:0 --from=runner-provider-pack /provider-pack /opt/paperclip-runner/provider-pack
-COPY --from=runner-provider-pack /provider-pack-transport/ /opt/paperclip-runner/
+COPY --link --chown=0:0 --from=runner-provider-pack /provider-pack /opt/paperclip-runner/provider-pack
+COPY --link --from=runner-provider-pack /provider-pack-transport/ /opt/paperclip-runner/
 # Managed deployments can remap node's UID at startup. This immutable pack
 # contains public code and integrity metadata, never credentials; it must remain
 # readable afterward.
 # Keep it root-owned and verify access as an unrelated unprivileged UID.
-RUN chmod -R a+rX /opt/paperclip-runner/provider-pack \
-  && if [ -f /opt/paperclip-runner/provider-pack/provider-pack.json ]; then \
+RUN if [ -f /opt/paperclip-runner/provider-pack/provider-pack.json ]; then \
     gosu 65534:65534 node -e 'const fs = require("node:fs"); const path = require("node:path"); const root = "/opt/paperclip-runner/provider-pack"; const manifest = JSON.parse(fs.readFileSync(path.join(root, "provider-pack.json"), "utf8")); for (const artifact of Object.values(manifest.payload.artifacts)) fs.readFileSync(path.join(root, artifact.path)); fs.accessSync(path.join(root, manifest.payload.artifacts.nodeCommand.path), fs.constants.X_OK);'; \
   fi
 ENV PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH=/opt/paperclip-runner/provider-pack
+
+# Keep the pnpm install in its own image layer. The app layer overlays the
+# source and build outputs without recompressing the workspace's node_modules.
+COPY --link --chown=${USER_UID}:${USER_GID} --from=deps /app /app
+COPY --link --chown=${USER_UID}:${USER_GID} --exclude=node_modules --exclude=**/node_modules --from=build /app /app
 
 # Declare per-build metadata after the stable RUN layers. Docker includes
 # in-scope ARG values in a RUN's environment even when its command does not
