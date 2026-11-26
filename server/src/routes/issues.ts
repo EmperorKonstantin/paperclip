@@ -1,3 +1,4 @@
+import { readIssueGithubHandoff, releaseIssueGithubHandoff, reserveIssueGithubHandoff } from "../services/issue-github-handoff.js";
 import { listStalledDependencies } from "../services/recovery/blocker-stall-wakeups.js";
 import { confirmMcpAttachmentCleanup, recordMcpAttachmentCleanup, type McpAttachmentCleanup } from "../services/public-mcp/upload-cleanup.js";
 import { notifyDeferredExecutionWork } from "../services/deferred-execution-notifications.js";
@@ -14368,6 +14369,49 @@ export function issueRoutes(
       { code: "native_run_status_reported_by_finish", requestedStatus },
     );
   }
+
+  const githubHandoffPath = "/issues/:id/github-handoff";
+  const githubHandoffOperation = z.object({
+    operationId: z.string().uuid(),
+    action: z.enum(["approve", "merge"]),
+    sha: z.string().regex(/^[a-f0-9]{40}$/),
+    statusVersion: z.number().int().nonnegative(),
+    projectId: z.string().uuid(),
+    workspaceId: z.string().uuid().nullable(),
+    assigneeAgentId: z.string().uuid().nullable(),
+    begin: z.boolean(),
+  }).strict();
+
+  async function githubHandoffIssue(req: Request, res: Response) {
+    if (req.actor.type !== "board" || req.actor.source === "mcp_oauth") {
+      throw forbidden("A board owner is required to manage GitHub handoffs");
+    }
+    const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!issue || !(await assertIssueReadAllowed(req, res, issue)) ||
+        !(await assertCanManageIssuePrivacy(req, res, issue))) return null;
+    return issue;
+  }
+
+  router.get(githubHandoffPath, async (req, res) => {
+    const issue = await githubHandoffIssue(req, res);
+    if (issue) res.json(await readIssueGithubHandoff(db, issue.id));
+  });
+
+  router.post(githubHandoffPath, validate(githubHandoffOperation), async (req, res) => {
+    const issue = await githubHandoffIssue(req, res);
+    if (!issue) return;
+    const { begin, operationId, action, sha, ...expected } = githubHandoffOperation.parse(req.body);
+    res.json(await reserveIssueGithubHandoff(db, issue.id, { operationId, action, sha }, expected, begin));
+  });
+
+  router.delete(`${githubHandoffPath}/:operationId`, async (req, res) => {
+    const issue = await githubHandoffIssue(req, res);
+    if (!issue) return;
+    const operationId = z.string().uuid().safeParse(req.params.operationId);
+    if (!operationId.success) throw unprocessable("A valid operation ID is required");
+    await releaseIssueGithubHandoff(db, issue.id, operationId.data);
+    res.status(204).end();
+  });
 
   router.patch(
     ["/issues/:id", "/issues/:id/activate-workflow-stage"],

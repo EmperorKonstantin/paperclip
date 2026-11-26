@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, executionWorkspaces, heartbeatRuns, issueTreeHolds, issues } from "@paperclipai/db";
+import { agents, companies, createDb, executionWorkspaces, heartbeatRuns, issueTreeHolds, issues, projects } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { agentRoutes } from "../routes/agents.js";
@@ -315,6 +315,30 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(response.status, JSON.stringify(response.body)).toBe(409);
     expect(response.body.details).toMatchObject({ code: "workflow_stage_handoff_changed" });
     expect(await issueService(db).getById(stage.id)).toMatchObject({status: "backlog", assigneeAgentId: null});
+  });
+
+  it.each(["approve", "merge"] as const)("orders %s reservations against owner holds and issue reopen", async (action) => {
+    const { app, source } = await workflowStage();
+    const [project] = await db.insert(projects).values({ companyId: source.companyId, name: "Handoff project" }).returning();
+    const [parent] = await db.insert(issues).values({ companyId: source.companyId, title: "Ancestor" }).returning();
+    await db.update(issues).set({ projectId: project!.id, parentId: parent!.id }).where(eq(issues.id, source.id));
+    const path = `/api/issues/${source.id}/github-handoff`;
+    const body = { operationId: randomUUID(), action, sha: "a".repeat(40), statusVersion: source.statusVersion,
+      projectId: project!.id, workspaceId: source.executionWorkspaceId, assigneeAgentId: null };
+    const hold = { companyId: source.companyId, rootIssueId: parent!.id, mode: "pause", createdByActorType: "user" };
+    const prepared = await request(app).post(path).send({ ...body, begin: false });
+    expect(prepared.status, JSON.stringify(prepared.body)).toBe(200);
+    const [firstHold] = await db.insert(issueTreeHolds).values(hold).returning();
+    expect((await request(app).post(path).send({ ...body, begin: true })).status).toBe(409);
+    await db.delete(issueTreeHolds).where(eq(issueTreeHolds.id, firstHold!.id));
+    const started = await request(app).post(path).send({ ...body, begin: true });
+    expect(started.status, JSON.stringify(started.body)).toBe(200);
+    expect(started.body.startedAt).toBeTruthy();
+    await expect(db.insert(issueTreeHolds).values(hold)).rejects.toMatchObject({ cause: { code: "P0214" } });
+    await expect(db.update(issues).set({ status: "todo" }).where(eq(issues.id, source.id)))
+      .rejects.toMatchObject({ cause: { code: "P0214" } });
+    expect((await request(app).delete(`${path}/${body.operationId}`)).status).toBe(204);
+    await db.insert(issueTreeHolds).values(hold);
   });
 
   it("rejects stale promotion before clearing its monitor", async () => {

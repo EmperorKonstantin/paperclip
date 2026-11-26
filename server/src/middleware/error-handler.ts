@@ -163,6 +163,14 @@ export function errorHandler(
   _next: NextFunction,
 ) {
   const err = clientToolGatewayErrorAsHttpError(thrown);
+  const databaseError = thrown as { code?: string; cause?: { code?: string } } | null;
+  if (databaseError?.code === "P0214" || databaseError?.cause?.code === "P0214") {
+    res.status(409).json({
+      error: "The issue has a GitHub operation in flight. Retry after the operation is confirmed.",
+      details: { code: "github_handoff_in_flight" },
+    });
+    return;
+  }
   if (err instanceof AgentLifecycleConflict) { res.status(409).json({ error: err.message }); return; }
   if (err instanceof HttpError) {
     const details =
