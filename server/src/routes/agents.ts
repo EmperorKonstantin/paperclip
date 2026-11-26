@@ -1,3 +1,4 @@
+import { z } from "zod";
 import { assertProviderApiPlacementPolicy, managedCursorApiDefaultEnabled, resolveProviderApiPlacement } from "../services/native-runtime/provider-api-placement.js";
 import { isObjectJournalBusyError } from "../services/object-byte-journal.js";
 import { readTaskPanelActivations } from "../services/plugin-task-panels.js";
@@ -7273,18 +7274,32 @@ export function agentRoutes(
     ));
   });
 
-  router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
+  const completedImplementationStopSchema = z.object({
+    cancellationRequestId: z.string().uuid(),
+    completedImplementation: z.object({
+      issueId: z.string().uuid(),
+      statusVersion: z.number().int().nonnegative(),
+      assigneeAgentId: z.string().uuid().nullable(),
+      runAgentId: z.string().uuid(),
+    }).strict(),
+  }).strict();
+  router.post(["/heartbeat-runs/:runId/cancel", "/heartbeat-runs/:runId/cancel-completed-implementation"], async (req, res) => {
     assertBoard(req);
     const runId = readHeartbeatRunId(req);
     const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!existing) return;
     if (!(await assertRunReadAllowed(req, res, existing))) return;
+    const guarded = req.path.endsWith("/cancel-completed-implementation")
+      ? completedImplementationStopSchema.safeParse(req.body)
+      : null;
+    if (guarded && !guarded.success) throw badRequest("Invalid completed implementation cancellation guard");
     const requestId = cancellationRequestId(req.body?.cancellationRequestId);
     // Stamp the cancellation as operator-initiated (this route is board-only).
     // Recovery reads this to stand down instead of classifying the cancelled
     // run as agent stranding and re-waking the agent the operator just stopped.
     const run = await heartbeat.cancelRun(runId, "Cancelled by a board operator", {
       ...(requestId ? { cancellationRequestId: requestId, cancellationRequestedByUserId: req.actor.userId ?? null } : {}),
+      ...(guarded?.success ? { completedImplementation: guarded.data.completedImplementation } : {}),
       resultJson: {
         cancelledByActorType: "user",
         cancelledByUserId: req.actor.userId ?? null,

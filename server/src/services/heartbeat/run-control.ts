@@ -1,3 +1,4 @@
+import { issueTreeControlService } from "../issue-tree-control.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { writeDeferredExecutionWait } from "../deferred-execution-wait.js";
 import type { DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
@@ -100,6 +101,8 @@ import {
 } from "@paperclipai/shared";
 import {
   agentWakeupRequests,
+  approvals,
+  issueApprovals,
   browserUseRuns,
   browserUseSessions,
   companies,
@@ -296,6 +299,12 @@ export type CancelRunOptions = {
     /** Optional board request identity, atomically reserved for native Stop. */
     cancellationRequestId?: string;
     cancellationRequestedByUserId?: string | null;
+    completedImplementation?: {
+      issueId: string;
+      statusVersion: number;
+      assigneeAgentId: string | null;
+      runAgentId: string;
+    };
     errorCode?: string;
     resultJson?: Record<string, unknown>;
     eventMessage?: string;
@@ -1235,21 +1244,61 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       cancelledByUserId: options.resultJson?.cancelledByUserId,
     };
     const handoffIssueId = run.nativeIssueId ?? run.issueId ?? (typeof run.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : null);
-    const supersedesCaseHandoff = options.resultJson?.cancelledByActorType === "user" || options.errorCode === "issue_reassigned";
+    const completedImplementation = options.completedImplementation;
+    if (completedImplementation && (handoffIssueId !== completedImplementation.issueId ||
+        run.agentId !== completedImplementation.runAgentId || !options.cancellationRequestId)) {
+      throw conflict("The completed implementation cancellation no longer matches the run.", { code: "implementation_stop_conflict" });
+    }
+    const supersedesCaseHandoff = Boolean(completedImplementation) ||
+      options.resultJson?.cancelledByActorType === "user" || options.errorCode === "issue_reassigned";
+    let cancellationRequestId = options.cancellationRequestId;
     let cancellationClaimed = false;
     let caseHandoffRetryClaimed = false;
     if (handoffIssueId && supersedesCaseHandoff && options.resultJson?.caseHandoffYieldStop !== true) {
       const publications: ActivityPublication[] = [];
       const applySupersession = () => db.transaction(async tx => {
+        if (completedImplementation) {
+          // A hold can be inserted without changing the issue row. Keep hold and
+          // approval writes ordered against this short cancellation claim.
+          await tx.execute(sql`lock table issue_tree_holds, issue_approvals, approvals in share mode`);
+        }
         const [issue] = await tx.select({ id: issues.id, executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId,
+          status: issues.status, statusVersion: issues.statusVersion,
           assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId }).from(issues)
           .where(and(eq(issues.companyId, run!.companyId), eq(issues.id, handoffIssueId))).for("update");
         const [current] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId),
           eq(heartbeatRuns.companyId, run!.companyId))).for("update");
         if (!current || (options.expectedStatus && current.status !== options.expectedStatus)) return false;
+        if (completedImplementation) {
+          const currentIssueId = current.nativeIssueId ?? current.issueId ?? current.contextSnapshot?.issueId;
+          const [pendingApproval] = await tx.select({ id: approvals.id }).from(issueApprovals)
+            .innerJoin(approvals, and(eq(approvals.companyId, issueApprovals.companyId), eq(approvals.id, issueApprovals.approvalId)))
+            .where(and(eq(issueApprovals.companyId, current.companyId), eq(issueApprovals.issueId, handoffIssueId),
+              inArray(approvals.status, ["pending", "revision_requested"]))).limit(1);
+          const pause = await issueTreeControlService(tx as unknown as Db).getActivePauseHoldGate(current.companyId, handoffIssueId);
+          if (!issue || issue.status !== "done" || issue.statusVersion !== completedImplementation.statusVersion ||
+              issue.assigneeAgentId !== completedImplementation.assigneeAgentId || issue.assigneeUserId ||
+              currentIssueId !== handoffIssueId || current.agentId !== completedImplementation.runAgentId ||
+              (issue.assigneeAgentId !== null && issue.assigneeAgentId !== current.agentId) ||
+              pendingApproval || pause) {
+            throw conflict("Implementation completion, assignee, or owner hold changed before cancellation.", {
+              code: "implementation_stop_conflict",
+            });
+          }
+          if (current.status !== "running" && current.status !== "queued") {
+            if (isHeartbeatRunTerminalStatus(current.status)) {
+              run = current;
+              return true;
+            }
+            throw conflict("The implementation run is no longer queued or running.", { code: "implementation_stop_conflict" });
+          }
+        }
         run = current;
-        if (options.cancellationRequestId) {
-          run = await claimCancellationRequest(tx as unknown as Db, runId, run!.companyId, options.cancellationRequestId,
+        // Native Stop has a separate correlated receipt. Legacy Stop uses
+        // the durable cancellation fence in this transaction.
+        if (completedImplementation && current.runtimeMode !== "native") cancellationRequestId = undefined;
+        if (cancellationRequestId) {
+          run = await claimCancellationRequest(tx as unknown as Db, runId, run!.companyId, cancellationRequestId,
             options.cancellationRequestedByUserId ?? null);
           cancellationClaimed = true;
         }
@@ -1267,11 +1316,11 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
             eq(nativeRunFinalizations.runId, runId), eq(nativeRunFinalizations.companyId, currentRun.companyId),
             eq(nativeRunFinalizations.issueId, currentRun.nativeIssueId))).for("update", { noWait: true }).limit(1);
           caseHandoffRetryClaimed = nativeRetryCancellationEligible({ runId, companyId: currentRun.companyId,
-            issueId: currentRun.nativeIssueId, resultJson: currentRun.resultJson, requestId: options.cancellationRequestId }, coordinator);
+            issueId: currentRun.nativeIssueId, resultJson: currentRun.resultJson, requestId: cancellationRequestId }, coordinator);
           if (caseHandoffRetryClaimed) cancellableStatuses.push("failed");
         }
         const requestedAt = new Date().toISOString();
-        const guardedCancellation = options.expectedStatus ? {
+        const guardedCancellation = options.expectedStatus || completedImplementation ? {
           cancellation: (currentRun.resultJson?.startupCancellation ? readRunCancellation(currentRun.resultJson) : null)
             ?? requestedRunCancellation(options.resultJson ?? {}, reason),
           // Promotion must remain fenced after this transaction releases the
@@ -1286,7 +1335,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           })}::jsonb`,
         }).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, run!.companyId),
           inArray(heartbeatRuns.status, cancellableStatuses))).returning();
-        if (options.expectedStatus && !fenced) return false;
+        if ((options.expectedStatus || completedImplementation) && !fenced) return false;
         if (fenced) run = fenced;
         // A board terminal request deliberately has no source run. It belongs
         // to the current task execution, not whichever historical run is stopped.
@@ -1311,6 +1360,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           // receipts before re-reading current authority under fresh locks.
           // Provider Stop and publication happen only after this boundary.
           run = previousRun;
+          cancellationRequestId = options.cancellationRequestId;
           cancellationClaimed = false;
           caseHandoffRetryClaimed = false;
           publications.length = 0;
@@ -1320,8 +1370,9 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       publications.forEach(publishActivity);
       if (!supersessionApplied) return null;
     }
-    if (options.cancellationRequestId && !cancellationClaimed) {
-      run = await claimCancellationRequest(db, runId, run.companyId, options.cancellationRequestId, options.cancellationRequestedByUserId ?? null);
+    if (completedImplementation && isHeartbeatRunTerminalStatus(run.status)) return run;
+    if (cancellationRequestId && !cancellationClaimed) {
+      run = await claimCancellationRequest(db, runId, run.companyId, cancellationRequestId, options.cancellationRequestedByUserId ?? null);
     }
     // The caller claim checked retry eligibility under both durable row locks.
     // This is only a cancellation candidate: dispatch rechecks the coordinator
@@ -1329,7 +1380,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     // retry fence. Re-reading only retryable_failure here would strand replay.
     const pendingNativeRetry =
       run.runtimeMode === "native" && run.status === "failed" && Boolean(run.nativeIssueId) && (
-        caseHandoffRetryClaimed || Boolean(options.cancellationRequestId) || await db
+        caseHandoffRetryClaimed || Boolean(cancellationRequestId) || await db
           .select(nativeManualAdmissionOwnerColumns)
           .from(nativeRunFinalizations)
           .where(
@@ -1383,7 +1434,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     // Established legacy processes must still be stopped if the database is
     // unavailable. Only native or not-yet-dispatched preparation needs this
     // additional durable fence before its existing cancellation path.
-    if (!committedBudgetCancellation && (options.expectedStatus || options.budgetEnforcement || (!options.cancellationRequestId && (run.runtimeMode === "native" || (!run.runtimeModeResolvedAt && !running && !control))))) {
+    if (!committedBudgetCancellation && (options.expectedStatus || options.budgetEnforcement || (!cancellationRequestId && (run.runtimeMode === "native" || (!run.runtimeModeResolvedAt && !running && !control))))) {
       const fence = async (tx: Db) => {
         await notifyScheduledRetryCancellation(tx, { companyId: run!.companyId, runId });
         const [fenced] = await tx.update(heartbeatRuns).set({
@@ -1484,7 +1535,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
                   runId: run.id,
                   reason,
                   runtimeMode: run.runtimeMode,
-                  ...(options.cancellationRequestId ? { cancellationRequestId: options.cancellationRequestId } : {}),
+                  ...(cancellationRequestId ? { cancellationRequestId: cancellationRequestId } : {}),
                 });
               } catch (error) {
                 // The durable Stop intent is recorded, but its owner (a native

@@ -3,9 +3,10 @@ import express from "express";
 import request from "supertest";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, issues } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, issueTreeHolds, issues } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { agentRoutes } from "../routes/agents.js";
 import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 import { issueService } from "../services/issues.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -42,6 +43,7 @@ const support = await getEmbeddedPostgresTestSupport();
       next();
     });
     app.use("/api", issueRoutes(db, {} as any));
+    app.use("/api", agentRoutes(db));
     app.use(errorHandler);
     return { app, issue: issue! };
   }
@@ -199,6 +201,82 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await issueService(db).getById(issue.id)).toMatchObject({
       status: "in_progress", assigneeAgentId: completed!.assigneeAgentId,
     });
+  });
+
+  async function stalledImplementation(status: "queued" | "running" = "running") {
+    const { app, issue } = await fixture();
+    const [completed] = await db.update(issues).set({
+      status: "done", executionPolicy: null, executionState: null,
+      monitorNextCheckAt: null, monitorWakeRequestedAt: null,
+    }).where(eq(issues.id, issue.id)).returning();
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId: issue.companyId, agentId: issue.assigneeAgentId!, scopeKind: "issue", issueId: issue.id, status,
+    }).returning();
+    return { app, issue: completed!, run: run!, body: { cancellationRequestId: randomUUID(), completedImplementation: {
+      issueId: issue.id, statusVersion: completed!.statusVersion, assigneeAgentId: issue.assigneeAgentId,
+      runAgentId: issue.assigneeAgentId,
+    } } };
+  }
+
+  it("stops only the bound run and preserves completion and assignment", async () => {
+    const { app, issue, run, body } = await stalledImplementation("queued");
+    const response = await request(app).post(`/api/heartbeat-runs/${run.id}/cancel-completed-implementation`).send(body);
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body.status).toBe("cancelled");
+    expect(await issueService(db).getById(issue.id)).toMatchObject({
+      status: "done", statusVersion: issue.statusVersion, assigneeAgentId: issue.assigneeAgentId,
+    });
+  });
+
+  it("does not stop a run when owner hold insertion wins the cancellation claim", async () => {
+    const { app, issue, run, body } = await stalledImplementation();
+    const holdDb = createDb(temporary.connectionString, { maxConnections: 1 });
+    const probeDb = createDb(temporary.connectionString, { maxConnections: 1 });
+    let release!: () => void;
+    let ready!: (pid: number) => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const held = new Promise<number>(resolve => { ready = resolve; });
+    const hold = holdDb.transaction(async tx => {
+      await tx.insert(issueTreeHolds).values({
+        companyId: issue.companyId, rootIssueId: issue.id, mode: "pause", createdByActorType: "user",
+      });
+      ready((await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`))[0]!.pid);
+      await gate;
+    });
+    const ownerPid = await held;
+    const stopping = request(app).post(`/api/heartbeat-runs/${run.id}/cancel-completed-implementation`)
+      .send(body).then(response => response);
+    let waiting = false;
+    try {
+      const deadline = Date.now() + 5000;
+      while (!waiting && Date.now() < deadline) {
+        const [row] = await probeDb.execute<{ waiting: boolean }>(sql`
+          select exists (select 1 from pg_stat_activity
+            where datname = current_database() and wait_event_type = 'Lock'
+              and ${ownerPid} = any(pg_blocking_pids(pid))) as waiting
+        `);
+        waiting = row!.waiting;
+        if (!waiting) await new Promise(resolve => setTimeout(resolve, 20));
+      }
+    } finally {
+      release();
+      await hold;
+    }
+    const response = await stopping;
+    expect(waiting).toBe(true);
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "implementation_stop_conflict" });
+    const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    expect(saved).toEqual(run);
+  });
+
+  it("does not claim Stop after the implementation reopens", async () => {
+    const { app, issue, run, body } = await stalledImplementation();
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issue.id));
+    const response = await request(app).post(`/api/heartbeat-runs/${run.id}/cancel-completed-implementation`).send(body);
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    expect(saved).toEqual(run);
   });
 
   it("rejects stale promotion before clearing its monitor", async () => {
