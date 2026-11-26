@@ -13,7 +13,7 @@ import { hasVerifiedWorkspaceRepair } from "./workspace-recovery-receipt.js";
 import { readFailedPreparationSettlement } from "./failed-preparation-settlement.js";
 import { failedPreparationOwnsBoundedRetry } from "./failed-preparation-retry.js";
 import { hasVerifiedPreparationLog } from "./verified-preparation-log.js";
-import { executionStartedEventPredicate, isPreDispatchResourceWait, noRetainedExecutionPredicate } from "./pre-dispatch-execution-evidence.js";
+import { executionStartedEventPredicate, isPreDispatchResourceWait, noRetainedExecutionPredicate, settledRetryPredecessorPredicate } from "./pre-dispatch-execution-evidence.js";
 
 type Run = Pick<typeof heartbeatRuns.$inferSelect,
   "id" | "companyId" | "status" | "startedAt" | "finishedAt" | "runtimeMode" |
@@ -266,6 +266,30 @@ async function isCancelledUnclaimedWorkspaceWaitRetry(db: Db, run: Run): Promise
   return !result;
 }
 
+// The scheduler's own suppression event proves this queued retry lost admission
+// before it could launch. Keep the earlier run's reconciliation obligations.
+async function isCancelledSupersededDispositionRetry(db: Db, run: Run): Promise<boolean> {
+  const issueId = run.issueId ?? run.contextSnapshot?.issueId;
+  if (run.runtimeMode !== "legacy" || run.errorCode !== "issue_disposition_repair_superseded" ||
+      !run.finishedAt || typeof issueId !== "string" || !isUuidLike(issueId) ||
+      readRunCancellation(run.resultJson)?.initiator.type === "user") return false;
+  const [receipt] = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRuns)
+    .innerJoin(heartbeatRunEvents, and(eq(heartbeatRunEvents.companyId, heartbeatRuns.companyId),
+      eq(heartbeatRunEvents.agentId, heartbeatRuns.agentId), eq(heartbeatRunEvents.runId, heartbeatRuns.id)))
+    .where(and(
+      eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id),
+      eq(heartbeatRuns.scheduledRetryReason, "issue_disposition_repair"), isNotNull(heartbeatRuns.retryOfRunId),
+      lte(heartbeatRuns.scheduledRetryAt, run.finishedAt),
+      noRetainedExecutionPredicate(), noProviderOutputPredicate(), settledRetryPredecessorPredicate(),
+      eq(heartbeatRunEvents.eventType, "lifecycle"), eq(heartbeatRunEvents.stream, "system"),
+      eq(heartbeatRunEvents.level, "warn"), isNull(heartbeatRunEvents.sourceEventId),
+      sql`${heartbeatRunEvents.payload}->>'issueId' = ${issueId}`,
+      sql`${heartbeatRunEvents.payload}->>'scheduledRetryReason' = ${heartbeatRuns.scheduledRetryReason}`,
+      sql`${heartbeatRunEvents.payload}->>'scheduledRetryAttempt' = ${heartbeatRuns.scheduledRetryAttempt}::text`,
+    )).limit(1);
+  return Boolean(receipt);
+}
+
 /** Caller holds the coordinator and run locks when using this proof to admit
  * work. Attempt zero is a durable never-claimed receipt: every native executor
  * commits its first claim before it can start or attach a provider. */
@@ -290,7 +314,8 @@ export async function isCancelledNativeStartup(db: Db, run: Run, coordinator: Co
     run.runnerProfileJson?.remoteWorkspace == null && run.resultJson?.workspaceRestoreFailure == null &&
     !hasRequiredWorkspaceRecovery(run.resultJson));
   const unclaimedWorkspaceRetry = !coordinator && await isCancelledUnclaimedWorkspaceWaitRetry(db, run);
-  const beforeSelection = beforeDispatch || unclaimedWorkspaceRetry || historicalBeforeSelection || run.runtimeMode === "legacy" && !run.runtimeModeResolvedAt &&
+  const supersededDispositionRetry = !coordinator && await isCancelledSupersededDispositionRetry(db, run);
+  const beforeSelection = beforeDispatch || unclaimedWorkspaceRetry || supersededDispositionRetry || historicalBeforeSelection || run.runtimeMode === "legacy" && !run.runtimeModeResolvedAt &&
     !run.nativeSessionId && !coordinator && claimedAdapterType(run) === "paperclip_runner" &&
     cancellation?.beforeNativeSelection === true;
   const neverClaimed = run.runtimeMode === "native" && coordinator &&
@@ -299,7 +324,7 @@ export async function isCancelledNativeStartup(db: Db, run: Run, coordinator: Co
     !coordinator.controllerPid && !coordinator.leaseOwner && !coordinator.leaseExpiresAt &&
     !coordinator.resultId && !coordinator.failureDetail?.successorRunId;
   if (!beforeSelection && !neverClaimed) return false;
-  const settled = beforeDispatch || unclaimedWorkspaceRetry || typeof run.resultJson?.startupPreparationSettledAt === "string";
+  const settled = beforeDispatch || unclaimedWorkspaceRetry || supersededDispositionRetry || typeof run.resultJson?.startupPreparationSettledAt === "string";
   // The old preparer can still be unwinding even though the run is terminal.
   if (await preparerMayStillUnwind(run)) return false;
   const leases = await db.select().from(environmentLeases).where(and(

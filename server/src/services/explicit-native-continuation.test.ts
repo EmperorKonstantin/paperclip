@@ -177,6 +177,43 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
     expect(retryBlocked).toEqual(retry === null ? [] : [retry]);
   });
 
+  it.each(["settled", "missing_receipt", "provider_started", "predecessor_held"])(
+    "requires scheduler and stop evidence for a superseded disposition retry (%s)", async scenario => {
+      const f = await seed(), predecessorId = randomUUID();
+      const dueAt = new Date("2026-09-11T09:59:00Z");
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+      await db.insert(heartbeatRuns).values({ id: predecessorId, companyId: f.companyId, agentId: f.agentId,
+        scopeKind: "issue", issueId: f.issueId, runtimeMode: "legacy", status: "succeeded",
+        createdAt: new Date("2026-09-11T09:57:00Z"), finishedAt: new Date("2026-09-11T09:58:00Z") });
+      await db.update(heartbeatRuns).set({ scopeKind: "issue", issueId: f.issueId, runtimeMode: "legacy",
+        nativeIssueId: null, processPid: null, status: "cancelled", retryOfRunId: predecessorId,
+        scheduledRetryReason: "issue_disposition_repair", scheduledRetryAt: dueAt, scheduledRetryAttempt: 2,
+        createdAt: dueAt, errorCode: "issue_disposition_repair_superseded",
+      }).where(eq(heartbeatRuns.id, f.sourceRunId));
+      await db.update(issueRecoveryActions).set({ cause: "legacy_execution_requires_reconciliation" })
+        .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+      if (scenario !== "missing_receipt") await appendHeartbeatRunEvent(db, {
+        companyId: f.companyId, agentId: f.agentId, runId: f.sourceRunId,
+        eventType: "lifecycle", stream: "system", level: "warn",
+        message: "Scheduled disposition repair suppressed because the source state changed or gained a durable path",
+        payload: { issueId: f.issueId, scheduledRetryReason: "issue_disposition_repair", scheduledRetryAttempt: 2 },
+      });
+      if (scenario === "provider_started") await appendHeartbeatRunEvent(db, {
+        companyId: f.companyId, agentId: f.agentId, runId: f.sourceRunId,
+        eventType: "turn.started", stream: "system", level: "info",
+      });
+      if (scenario === "predecessor_held") await db.insert(issueRecoveryActions).values({
+        companyId: f.companyId, sourceIssueId: f.issueId, kind: "active_run_watchdog",
+        cause: "legacy_execution_requires_reconciliation", fingerprint: predecessorId, status: "resolved",
+        nextAction: "Verify the original execution.", evidence: { runId: predecessorId, automaticRecovery: { replay: "blocked" } },
+      });
+
+      const result = await admitExplicitNativeContinuation({ ...f, db, dryRun: true, reason: "retry_failed_run",
+        failedRunId: f.sourceRunId });
+      if (scenario === "settled") expect(result).toMatchObject({ previousRunId: f.sourceRunId });
+      else expect(result).toBeNull();
+    });
+
   it("keeps admission and the complete locked session profile while omitting prompt data", async () => {
     const f = await seed();
     const payload = randomBytes(128 * 1024).toString("base64");
