@@ -70,7 +70,10 @@ export async function requestGitHubInstallationCredential(options: BrokerOptions
     throw new GitHubCheckoutBrokerError("invalid_configuration");
   }
 
-  const signal = AbortSignal.timeout(options.timeoutMs ?? 5000);
+  // The active-run broker rechecks assignment authorization around issuance.
+  // Leave time for those checks while keeping the Git helper's 10-second deadline.
+  const timeoutMs = options.timeoutMs ?? (request.operation === "write" ? 8000 : 5000);
+  const signal = AbortSignal.timeout(timeoutMs);
   try {
     const response = await fetch(endpoint, {
       method: "POST",

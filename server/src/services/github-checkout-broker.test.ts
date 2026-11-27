@@ -1,6 +1,6 @@
 import { createServer, type RequestListener } from "node:http";
 import { once } from "node:events";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { requestGitHubInstallationCredential } from "./github-checkout-broker.js";
 
 const scope = { operation: "checkout" as const, companyId: "company", projectId: "project", workspaceId: "workspace", repositoryId: "1234", repository: "example/repo" };
@@ -56,6 +56,23 @@ describe("GitHub checkout credential broker", () => {
       await expect(requestGitHubInstallationCredential({ endpoint, serviceToken }, scope))
         .rejects.toMatchObject({ code: "invalid_response" });
     });
+  });
+
+  it("gives an active run more time for authorization than workspace checkout", async () => {
+    const writeScope = { ...scope, operation: "write" as const, agentId: "agent", issueId: "issue", runId: "run" };
+    const deadline = vi.spyOn(AbortSignal, "timeout");
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      return Response.json({ ...payload, scope: JSON.parse(String(init?.body)) });
+    });
+    try {
+      const options = { endpoint: "https://broker.example.test", serviceToken };
+      await expect(requestGitHubInstallationCredential(options, scope)).resolves.toBe(token);
+      await expect(requestGitHubInstallationCredential(options, writeScope)).resolves.toBe(token);
+      expect(deadline.mock.calls).toEqual([[5000], [8000]]);
+    } finally {
+      fetch.mockRestore();
+      deadline.mockRestore();
+    }
   });
 
   it("stops waiting on a stalled response body", async () => {
