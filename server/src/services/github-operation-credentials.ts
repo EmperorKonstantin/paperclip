@@ -18,6 +18,7 @@ import {
 } from "./git-credentials.js";
 import { secretService } from "./secrets.js";
 import { githubAppProjectBinding, scopedGitHubAppCredential } from "./github-app-credentials.js";
+import { GitHubCheckoutBrokerError, type GitHubBrokerFailure } from "./github-checkout-broker.js";
 import { normalizeProjectRepositoryUrl } from "./project-repositories.js";
 import { assertTaskWorkspaceExecutionAccess } from "./task-workspace-access.js";
 import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
@@ -28,13 +29,14 @@ export type GitHubCredentialSummary = {
   source?: "personal" | "dedicated";
   login?: string;
   reason?: string;
+  brokerFailure?: GitHubBrokerFailure;
   connectionId?: string;
   grantId?: string;
   authenticationMode?: "managed" | "host" | "anonymous";
 };
 
 type GitHubCredentialRun = Pick<typeof heartbeatRuns.$inferSelect,
-  "id" | "companyId" | "agentId" | "nativeIssueId" | "contextSnapshot">;
+  "id" | "companyId" | "agentId" | "issueId" | "nativeIssueId" | "responsibleUserId" | "contextSnapshot">;
 
 /** A raw GitHub token cannot enforce the low-trust read-only tool boundary. */
 async function allowsGitHubCredentialExport(
@@ -176,7 +178,7 @@ async function resolveCapturedGitHubCredentials(db: Db, run: GitHubCredentialRun
   }
   try {
     const appToken = process.env.PAPERCLIP_GITHUB_APP_PROJECTS
-      ? await resolveGitHubAppRunToken(db, input, run, context)
+      ? await resolveGitHubAppRunToken(db, run, context)
       : undefined;
     if (appToken) {
       summary = { status: "available", source: "dedicated", authenticationMode: "managed" };
@@ -221,12 +223,17 @@ async function resolveCapturedGitHubCredentials(db: Db, run: GitHubCredentialRun
         reason: resolved.error ?? "No GitHub identity connected",
       };
     }
-  } catch {
-    // Provider/secret errors can contain sensitive response bodies. Never persist them.
-    summary = {
-      status: "unavailable",
-      reason: "GitHub credentials are temporarily unavailable",
-    };
+  } catch (error) {
+    if (error instanceof GitHubCheckoutBrokerError) {
+      summary = {
+        status: "unavailable",
+        reason: error.message,
+        brokerFailure: { code: error.code, httpStatus: error.httpStatus },
+      };
+    } else {
+      // Provider and secret errors may contain sensitive response bodies.
+      summary = { status: "unavailable", reason: "GitHub credentials are temporarily unavailable" };
+    }
   }
   if (context) await saveGitHubSummary(db, context, summary);
   return {
@@ -237,8 +244,9 @@ async function resolveCapturedGitHubCredentials(db: Db, run: GitHubCredentialRun
   };
 }
 
-async function resolveGitHubAppRunToken(db: Db, input: { companyId: string; agentId: string; runId: string },
-  run: typeof heartbeatRuns.$inferSelect, context: RunIdentityContext) {
+async function resolveGitHubAppRunToken(db: Db, run: GitHubCredentialRun, context: RunIdentityContext) {
+  const { companyId, agentId, id: runId } = run;
+  const input = { companyId, agentId, runId };
   const issueId = run.issueId ?? run.nativeIssueId ?? run.contextSnapshot?.issueId ?? run.contextSnapshot?.taskId;
   if (typeof issueId !== "string" || !isUuidLike(issueId)) return undefined;
   const [issue] = await db.select({ projectId: issues.projectId, assigneeAgentId: issues.assigneeAgentId,

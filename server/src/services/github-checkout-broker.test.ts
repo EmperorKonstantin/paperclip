@@ -63,7 +63,7 @@ describe("GitHub checkout credential broker", () => {
       res.write("{");
     }, async (endpoint) => {
       await expect(requestGitHubInstallationCredential({ endpoint, serviceToken, timeoutMs: 150 }, scope))
-        .rejects.toMatchObject({ code: "unavailable" });
+        .rejects.toMatchObject({ code: "timeout" });
     });
   });
 
@@ -78,7 +78,7 @@ describe("GitHub checkout credential broker", () => {
       res.writeHead(403).end(token);
     }, async (endpoint) => {
       await expect(requestGitHubInstallationCredential({ endpoint, serviceToken }, scope))
-        .rejects.toMatchObject({ message: "GitHub checkout credential broker: denied" });
+        .rejects.toMatchObject({ code: "denied", httpStatus: 403, message: "GitHub checkout credential broker: denied (HTTP 403)" });
     });
   });
 });

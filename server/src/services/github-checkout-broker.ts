@@ -19,9 +19,15 @@ type BrokerOptions = {
 const MAX_RESPONSE_BYTES = 8192;
 const MAX_TOKEN_LIFETIME_MS = 61 * 60 * 1000;
 
+export type GitHubBrokerFailure = {
+  code: "invalid_configuration" | "denied" | "unavailable" | "invalid_response" | "timeout";
+  httpStatus?: number;
+};
+
 export class GitHubCheckoutBrokerError extends Error {
-  constructor(readonly code: "invalid_configuration" | "denied" | "unavailable" | "invalid_response") {
-    super("GitHub checkout credential broker: " + code.replaceAll("_", " "));
+  constructor(readonly code: GitHubBrokerFailure["code"], readonly httpStatus?: number) {
+    const status = httpStatus === undefined ? "" : ` (HTTP ${httpStatus})`;
+    super("GitHub checkout credential broker: " + code.replaceAll("_", " ") + status);
   }
 }
 
@@ -64,11 +70,12 @@ export async function requestGitHubInstallationCredential(options: BrokerOptions
     throw new GitHubCheckoutBrokerError("invalid_configuration");
   }
 
+  const signal = AbortSignal.timeout(options.timeoutMs ?? 5000);
   try {
     const response = await fetch(endpoint, {
       method: "POST",
       redirect: "error",
-      signal: AbortSignal.timeout(options.timeoutMs ?? 5000),
+      signal,
       headers: {
         accept: "application/json",
         authorization: `Bearer ${options.serviceToken}`,
@@ -77,9 +84,9 @@ export async function requestGitHubInstallationCredential(options: BrokerOptions
       body: JSON.stringify(request),
     });
     if (!response.ok) {
-      await response.body?.cancel();
+      await response.body?.cancel().catch(() => {});
       const denied = [401, 403, 404].includes(response.status);
-      throw new GitHubCheckoutBrokerError(denied ? "denied" : "unavailable");
+      throw new GitHubCheckoutBrokerError(denied ? "denied" : "unavailable", response.status);
     }
     const payload = await readCredentialResponse(response);
     if (!payload || typeof payload !== "object") throw new GitHubCheckoutBrokerError("invalid_response");
@@ -99,6 +106,6 @@ export async function requestGitHubInstallationCredential(options: BrokerOptions
   } catch (error) {
     if (error instanceof GitHubCheckoutBrokerError) throw error;
     // Transport failures can include response content or request headers.
-    throw new GitHubCheckoutBrokerError("unavailable");
+    throw new GitHubCheckoutBrokerError(signal.aborted ? "timeout" : "unavailable");
   }
 }
