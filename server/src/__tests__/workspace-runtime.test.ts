@@ -703,6 +703,25 @@ describe("refreshRemoteTrackingBaseRef git auth", () => {
     },
   );
 
+  it("refreshes only the authorized remote when Git is configured to fetch submodules", async () => {
+    const submodule = await createClonedRepoWithRemote();
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    await runGit(sourceRepo, ["-c", "protocol.file.allow=always", "submodule", "add", submodule.remotePath, "dependency"]);
+    await runGit(sourceRepo, ["commit", "-m", "Add submodule"]);
+    await runGit(sourceRepo, ["push", remotePath, "HEAD:master"]);
+    await runGit(repoRoot, ["pull", "--ff-only"]);
+    await runGit(repoRoot, ["-c", "protocol.file.allow=always", "submodule", "update", "--init"]);
+    await runGit(path.join(repoRoot, "dependency"), ["remote", "set-url", "origin", path.join(repoRoot, "missing.git")]);
+    await runGit(repoRoot, ["config", "fetch.recurseSubmodules", "true"]);
+    const expected = await advanceRemoteMaster(sourceRepo, remotePath, "scoped-update.txt");
+
+    const approved = Object.assign(async () => ({
+      configArgs: [], env: { GIT_TERMINAL_PROMPT: "0" }, source: "managed_connection",
+    }), { requireScopedCheckout: true });
+    await expect(refreshRemoteTrackingBaseRef(repoRoot, "origin/master", approved)).resolves.toEqual([]);
+    expect(await readGit(repoRoot, ["rev-parse", "origin/master"])).toBe(expected);
+  });
+
   it("attributes a failed authenticated fetch to the credential that was used", async () => {
     const { repoRoot } = await createClonedRepoWithRemote();
     await runGit(repoRoot, ["remote", "set-url", "origin", path.join(os.tmpdir(), "paperclip-missing-remote", "repo.git")]);

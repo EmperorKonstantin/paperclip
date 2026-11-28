@@ -1069,6 +1069,7 @@ async function refreshRemoteTrackingBaseRefWithDiagnostic(
       ...(auth?.configArgs ?? []),
       "fetch",
       "--prune",
+      ...(resolveGitAuth?.requireScopedCheckout ? ["--no-recurse-submodules"] : []),
       remoteTracking.remote,
       `+refs/heads/${remoteTracking.branch}:refs/remotes/${remoteTracking.remote}/${remoteTracking.branch}`,
     ], repoRoot, {
