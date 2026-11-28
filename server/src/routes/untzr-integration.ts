@@ -34,11 +34,23 @@ const launch = context.extend({
   title: z.string().trim().min(1).max(240), description: z.string().max(100_000).optional(),
   taskBranch: untzrPublicationSchema.shape.taskBranch.optional(),
   startingCommit: untzrPublicationSchema.shape.startingCommit.optional(),
+  repositoryId: z.string().regex(/^[1-9][0-9]{0,19}$/).optional(),
+  workspaceId: uuid.optional(),
   predecessorIssueId: uuid.optional(),
   followUp: z.literal("true").optional(),
 }).refine(body => (body.taskBranch === undefined) === (body.startingCommit === undefined) &&
+    (!body.taskBranch || Boolean(body.repositoryId && body.workspaceId)) &&
     (!body.predecessorIssueId || Boolean(body.taskBranch)) && (!body.followUp || Boolean(body.predecessorIssueId)), {
-  message: "Publisher launches require the approved branch and starting commit. Follow-ups also require a predecessor.",
+  message: "Publisher launches require the approved repository, workspace, branch and starting commit. Follow-ups also require a predecessor.",
+});
+
+const releaseRequest = context.extend({
+  issueId: uuid,
+  taskBranch: untzrPublicationSchema.shape.taskBranch,
+  nextTaskBranch: untzrPublicationSchema.shape.taskBranch,
+  releasedCommit: untzrPublicationSchema.shape.startingCommit,
+}).refine(body => body.taskBranch !== body.nextTaskBranch, {
+  message: "An Untzr follow-up requires a distinct approved task branch",
 });
 
 const sourceRequest = context.extend({
@@ -95,17 +107,15 @@ export function untzrIntegrationRoutes(db: Db, storage: StorageService, options:
     async function replay() {
       const [saved] = await db.select({
         config: toolConnections.config, enabled: toolConnections.enabled, connectionStatus: toolConnections.status,
+        companyId: toolConnections.companyId, purpose: toolConnections.connectionPurpose,
         grantId: connectionGrants.id, grantStatus: connectionGrants.status, revokedAt: connectionGrants.revokedAt,
-        authorizationGeneration: connectionGrants.providerTenant,
-      }).from(toolConnections).innerJoin(connectionGrants, and(eq(connectionGrants.companyId, companyId),
+        providerTenant: connectionGrants.providerTenant,
+      }).from(toolConnections).leftJoin(connectionGrants, and(eq(connectionGrants.companyId, companyId),
         eq(connectionGrants.connectionId, toolConnections.id), eq(connectionGrants.kind, "user"),
-        eq(connectionGrants.subjectUserId, userId))).where(and(eq(toolConnections.companyId, companyId),
-        eq(toolConnections.id, id), eq(toolConnections.connectionPurpose, "ai")));
-      if (!saved) {
-        const [collision] = await db.select({ id: toolConnections.id }).from(toolConnections).where(eq(toolConnections.id, id));
-        if (collision) throw conflict("This Untzr provisioning request cannot be replayed");
-        return null;
-      }
+        eq(connectionGrants.subjectUserId, userId))).where(eq(toolConnections.id, id));
+      if (!saved) return null;
+      if (saved.companyId !== companyId || saved.purpose !== "ai" || !saved.grantId)
+        throw conflict("This Untzr provisioning request cannot be replayed");
       const marker = provisioningMarker.safeParse(saved.config.untzrApiKeyProvisioning);
       const metadata = aiConnectionMetadataSchema.safeParse(saved.config.ai);
       if (!marker.success || marker.data.projectId !== body.projectId || marker.data.fingerprint !== fingerprint ||
@@ -114,7 +124,7 @@ export function untzrIntegrationRoutes(db: Db, storage: StorageService, options:
         throw conflict("This Untzr provisioning request cannot be replayed");
       }
       return { connectionId: id, grantId: saved.grantId,
-        authorizationGeneration: saved.authorizationGeneration?.authorizationGeneration ?? saved.grantId };
+        authorizationGeneration: saved.providerTenant?.authorizationGeneration ?? saved.grantId };
     }
     let binding = await replay();
     if (!binding) {
@@ -214,10 +224,44 @@ export function untzrIntegrationRoutes(db: Db, storage: StorageService, options:
   router.post("/codex/complete", validate(codexAttempt), codexCommand("complete"));
   router.post("/codex/cancel", validate(codexAttempt), codexCommand("cancel"));
 
+  router.post("/release", validate(releaseRequest), async (req, res) => {
+    const body = releaseRequest.parse(req.body);
+    const scope = await resolveScope(body);
+    // The trusted Untzr publisher attests the independently verified GitHub release.
+    // A completed stage and its checkout SHA alone grant no cross-cycle authority.
+    const nextCycle = { taskBranch: body.nextTaskBranch, startingCommit: body.releasedCommit };
+    await db.transaction(async tx => {
+      const [issue] = await tx.select({ status: issues.status, untzrExecution: issues.untzrExecution })
+        .from(issues).where(and(eq(issues.companyId, scope.companyId), eq(issues.projectId, scope.projectId),
+          eq(issues.projectWorkspaceId, scope.workspaceId), eq(issues.id, body.issueId))).for("update");
+      const parsed = untzrExecutionSchema.safeParse(issue?.untzrExecution);
+      const publication = parsed.success ? parsed.data.publication : undefined;
+      if (issue?.status !== "done" || !parsed.success || !publication?.predecessorIssueId ||
+          parsed.data.subject !== scope.subject || parsed.data.userId !== scope.userId ||
+          parsed.data.repositoryId !== scope.repositoryId || parsed.data.repository !== scope.repository ||
+          parsed.data.ref !== scope.ref || publication.taskBranch !== body.taskBranch) {
+        throw forbidden("The released stage is outside the approved Untzr scope");
+      }
+      if (publication.nextCycle) {
+        if (publication.nextCycle.taskBranch !== nextCycle.taskBranch ||
+            publication.nextCycle.startingCommit !== nextCycle.startingCommit)
+          throw conflict("This Untzr release already authorizes another follow-up");
+        return;
+      }
+      await tx.update(issues).set({
+        untzrExecution: { ...parsed.data, publication: { ...publication, nextCycle } },
+      }).where(and(eq(issues.companyId, scope.companyId), eq(issues.id, body.issueId)));
+    });
+    res.json({ issueId: body.issueId, ...nextCycle });
+  });
+
   router.post("/launch", validate(launch), async (req, res) => {
     const body = launch.parse(req.body);
     const { agentIds, ...scope } = await resolveScope(body);
     const companyId = scope.companyId;
+    if ((body.repositoryId && body.repositoryId !== scope.repositoryId) ||
+        (body.workspaceId && body.workspaceId !== scope.workspaceId))
+      throw forbidden("The approved Untzr launch repository or workspace changed");
     if (!agentIds.includes(body.agentId)) throw forbidden("The selected agent is outside the approved Untzr scope");
     const approvedAgents = await db.select().from(agents)
       .where(and(eq(agents.companyId, companyId), inArray(agents.id, agentIds)));
@@ -234,9 +278,8 @@ export function untzrIntegrationRoutes(db: Db, storage: StorageService, options:
     const prior = predecessor?.untzrExecution ? untzrExecutionSchema.parse(predecessor.untzrExecution) : null;
     const priorPublication = prior?.publication;
     const branchMatches = body.followUp
-      ? Boolean(priorPublication?.predecessorIssueId) &&
-        priorPublication?.taskBranch !== body.taskBranch &&
-        priorPublication?.startingCommit === body.startingCommit &&
+      ? priorPublication?.nextCycle?.taskBranch === body.taskBranch &&
+        priorPublication?.nextCycle?.startingCommit === body.startingCommit &&
         priorPublication?.implementerAgentId === body.agentId
       : priorPublication?.taskBranch === body.taskBranch;
     if (body.predecessorIssueId && (predecessor?.status !== "done" || !prior?.publication ||

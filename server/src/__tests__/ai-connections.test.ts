@@ -206,7 +206,10 @@ describe("managed AI connections", () => {
       const launch = (user: number, body = {}) => request(app).post("/launch")
         .set("Authorization", `Bearer ${integrationKey}`)
         .send({ subject: users[user], companyId, projectId: project.id, provider: "anthropic", ...grants[user],
-          agentId: stages[0].id, title: "Scoped fixture", requestId: randomUUID(), taskBranch, startingCommit, ...body });
+          agentId: stages[0].id, title: "Scoped fixture", requestId: randomUUID(), taskBranch, startingCommit,
+          repositoryId: "83", workspaceId: workspace.id, ...body });
+      await launch(0, { repositoryId: "999" }).expect(403);
+      await launch(0, { workspaceId: randomUUID() }).expect(403);
       const roots = await Promise.all([launch(0), launch(1)]);
       for (const root of roots) expect(root.status, String(root.body.error)).toBe(202);
       expect(roots.map(root => root.body.authorizationGeneration)).toEqual(grants.map(grant => grant.grantId));
@@ -230,13 +233,23 @@ describe("managed AI connections", () => {
       });
       expect(wakeup).toHaveBeenCalledWith(stages[1].id, expect.objectContaining({ requestedByActorId: users[0] }));
       await db.update(issues).set({ status: "done" }).where(eq(issues.id, accepted.body.issueId));
+      const releasedCommit = "d".repeat(40);
       const followUp = {
         predecessorIssueId: accepted.body.issueId, taskBranch: "untzr/23456789abcdef01",
-        startingCommit: review.startingCommit, requestId: randomUUID(), followUp: "true",
+        startingCommit: releasedCommit, requestId: randomUUID(), followUp: "true",
       };
+      await launch(0, followUp).expect(403);
+      const release = (user: number, nextTaskBranch = followUp.taskBranch) => request(app).post("/release")
+        .set("Authorization", `Bearer ${integrationKey}`)
+        .send({ subject: users[user], companyId, projectId: project.id, issueId: accepted.body.issueId,
+          taskBranch, nextTaskBranch, releasedCommit });
+      await release(1).expect(403);
+      const confirmedRelease = await release(0).expect(200);
+      await release(0).expect(200).expect(confirmedRelease.body);
+      await release(0, "untzr/9876543210abcdef").expect(409);
       await launch(0, { ...followUp, followUp: undefined }).expect(403);
       await launch(0, { ...followUp, taskBranch }).expect(403);
-      await launch(0, { ...followUp, startingCommit: startingCommit }).expect(403);
+      await launch(0, { ...followUp, startingCommit: review.startingCommit }).expect(403);
       await launch(0, { ...followUp, agentId: stages[1].id }).expect(403);
       await launch(1, followUp).expect(403);
       const next = await launch(0, followUp).expect(202);
@@ -245,7 +258,7 @@ describe("managed AI connections", () => {
       const [nextIssue] = await db.select().from(issues).where(eq(issues.id, next.body.issueId));
       expect(nextIssue.untzrExecution).toMatchObject({
         ...grants[0], publication: {
-          taskBranch: followUp.taskBranch, startingCommit: review.startingCommit,
+          taskBranch: followUp.taskBranch, startingCommit: releasedCommit,
           predecessorIssueId: accepted.body.issueId, implementerAgentId: stages[0].id,
         },
       });
@@ -255,9 +268,18 @@ describe("managed AI connections", () => {
         .set("Authorization", `Bearer ${integrationKey}`)
         .send({ subject: users[user], companyId, projectId: project.id, provider: "anthropic", ...body });
       const keyBody = { apiKey: "fixture-personal-key", provisioningId };
-      const [provisioned, duplicate] = await Promise.all([
-        keyRequest("/api-key", 0, keyBody).expect(201), keyRequest("/api-key", 0, keyBody).expect(201),
-      ]);
+      let signalWaiting!: () => void;
+      const waitingAfterLookup = new Promise<void>(resolve => { signalWaiting = resolve; });
+      let resumeFirst!: () => void;
+      const allowFirstSave = new Promise<void>(resolve => { resumeFirst = resolve; });
+      validateKey.mockImplementationOnce(async () => {
+        signalWaiting();
+        await allowFirstSave;
+      });
+      const first = keyRequest("/api-key", 0, keyBody).expect(201).then(response => response);
+      await waitingAfterLookup;
+      const provisioned = await keyRequest("/api-key", 0, keyBody).expect(201).then(response => response).finally(resumeFirst);
+      const duplicate = await first;
       expect(provisioned.body).toEqual(duplicate.body);
       expect(provisioned.body).toEqual({
         connectionId: provisioningId, grantId: expect.any(String), authorizationGeneration: provisioned.body.grantId,

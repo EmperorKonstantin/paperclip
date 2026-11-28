@@ -56,13 +56,16 @@ identifier, and opaque authorization generation. Use a new ID for a new
 request. Configure isolated Paperclip Runner agents with the matching Codex
 or Claude harness for every approved stage.
 
-Publisher launches take `taskBranch` and `startingCommit` from Untzr's
-approved task branch. A later stage sends its `predecessorIssueId` with the
+Publisher launches take `repositoryId`, `workspaceId`, `taskBranch`, and
+`startingCommit` from Untzr's approved task assignment. A later stage sends its `predecessorIssueId` with the
 same branch, personal grant, and the publisher-verified current commit.
-A follow-up cycle sends `followUp` as the string `"true"`, a distinct approved
-branch, and the exact independently released commit. It starts with the
-original implementer and retains the original user, grant, project,
-workspace, and repository.
+Before launching a follow-up, the trusted publisher verifies the independent
+GitHub release and calls `release` with the completed stage's `issueId`, its
+`taskBranch`, the `releasedCommit`, and the approved `nextTaskBranch`.
+Identical release requests return the saved branch and commit. Launch the
+follow-up with `followUp` set to the string `"true"` and use that exact commit
+and new branch. The follow-up starts with the original implementer and retains
+the original user, grant, project, workspace, and repository.
 
 ## Source publication
 

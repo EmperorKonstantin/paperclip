@@ -39,6 +39,7 @@ export const untzrExecutionSchema = scopeSchema.omit({ agentIds: true }).extend(
   publication: untzrPublicationSchema.extend({
     predecessorIssueId: uuid.optional(),
     implementerAgentId: uuid.optional(),
+    nextCycle: untzrPublicationSchema.optional(),
   }).optional(),
 }).strict();
 export type UntzrExecution = z.infer<typeof untzrExecutionSchema>;
