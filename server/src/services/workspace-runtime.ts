@@ -171,6 +171,7 @@ export type GitRemoteAuthInvocation = {
 
 export type GitRemoteAuthProvider = ((remoteUrl: string) => Promise<GitRemoteAuthInvocation | null>) & {
   requireScopedCheckout?: boolean;
+  expectedCheckout?: { baseRef: string; sha: string };
 };
 
 export interface ExecutionWorkspaceIssueRef {
@@ -3462,6 +3463,18 @@ async function resolveGitRepoRootForWorkspaceCleanup(
   return path.dirname(resolvedGitDir);
 }
 
+function assertExpectedGitCheckout(
+  expected: GitRemoteAuthProvider["expectedCheckout"],
+  baseRef: string | null,
+  sha: string | null,
+  fetchWarnings: string[],
+) {
+  if (expected && (baseRef !== expected.baseRef || sha !== expected.sha || fetchWarnings.length > 0)) {
+    throw new WorkspaceRuntimeValidationFailure("The managed Git checkout does not match the approved Untzr starting commit.",
+      { workspaceValidation: { reason: "untzr_starting_commit_mismatch" } });
+  }
+}
+
 export async function realizeExecutionWorkspace(input: {
   db?: Db | null;
   base: ExecutionWorkspaceInput;
@@ -3580,6 +3593,7 @@ export async function realizeExecutionWorkspace(input: {
     ...(baseRefAlreadyRefreshed ? [] : await refreshRemoteTrackingBaseRef(repoRoot, baseRef, input.resolveGitAuth)),
   ];
   const currentBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
+  assertExpectedGitCheckout(input.resolveGitAuth?.expectedCheckout, baseRef, currentBaseRefSha, baseRefreshWarnings);
 
   await fs.mkdir(worktreeParentDir, { recursive: true });
 
@@ -4127,6 +4141,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       ? await refreshRemoteTrackingBaseRef(repoRoot, reuseBaseRef, input.resolveGitAuth)
       : [];
     const currentBaseRefSha = reuseBaseRef ? await resolveBaseRefSha(repoRoot, reuseBaseRef) : null;
+    assertExpectedGitCheckout(input.resolveGitAuth?.expectedCheckout, reuseBaseRef, currentBaseRefSha, baseRefreshWarnings);
     // An unstarted-worktree refresh can fast-forward the checked-out branch.
     // Never run it for an attached operator-owned ref.
     const refresh = !savedCommit && realized.branchCreatedByRuntime && reuseBaseRef && currentBaseRefSha

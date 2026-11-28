@@ -171,7 +171,8 @@ describe("managed AI connections", () => {
     const [issue] = await db.insert(issues).values({
       companyId, projectId: project.id, projectWorkspaceId: workspace.id, title: "Git checkout",
       assigneeAgentId: other.id, untzrExecution: { ...scope, ...grant, provider: "anthropic", method: "api_key",
-        stageAgents: { [approved.id]: { adapter: "paperclip_runner", harness: "claude_local" } } },
+        stageAgents: { [approved.id]: { adapter: "paperclip_runner", harness: "claude_local" } },
+        publication: { taskBranch: "untzr/0123456789abcdef", startingCommit: "a".repeat(40) } },
     }).returning();
     const checkout = (id: string) => githubAppTaskCheckout(db, companyId, issue.id, id, repoUrl);
     const previousJwtSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
@@ -331,7 +332,10 @@ describe("managed AI connections", () => {
         await db.update(assets).set({ createdByAgentId: approved.id, createdByUserId: null }).where(eq(assets.id, attachment.assetId));
         expect(getObject).not.toHaveBeenCalled();
         const response = await fetchSource().expect(200);
-        expect(response.body).toMatchObject({ ...report, runId: run.id, issueId: issue.id, sourceBase64: bytes.toString("base64") });
+        expect(response.body).toMatchObject({
+          ...report, runId: run.id, issueId: issue.id, authorizationGeneration: grant.grantId,
+          sourceBase64: bytes.toString("base64"),
+        });
         getObject.mockImplementationOnce(async (...args) => ({
           ...await originalGetObject(...args),
           stream: Readable.from([Buffer.alloc(bytes.length)]),

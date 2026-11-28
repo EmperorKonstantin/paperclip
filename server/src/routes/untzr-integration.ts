@@ -16,7 +16,7 @@ import { issueService } from "../services/issues.js";
 import { localAiLoginService } from "../services/local-ai-login.js";
 import { supportsLocalAiLogin } from "../services/local-ai-login-policy.js";
 import { assertUntzrExecution, authenticateUntzr, resolveUntzrScope, untzrExecutionSchema,
-  untzrProviderSchema, untzrSubjectSchema } from "../services/untzr-execution.js";
+  untzrProviderSchema, untzrPublicationSchema, untzrSubjectSchema } from "../services/untzr-execution.js";
 
 const uuid = z.string().uuid();
 const context = z.object({ subject: untzrSubjectSchema, companyId: uuid, projectId: uuid }).strict();
@@ -27,11 +27,15 @@ const launch = context.extend({
   provider: untzrProviderSchema, connectionId: uuid, grantId: uuid,
   agentId: uuid, requestId: z.string().min(1).max(160),
   title: z.string().trim().min(1).max(240), description: z.string().max(100_000).optional(),
+  taskBranch: untzrPublicationSchema.shape.taskBranch.optional(),
+  startingCommit: untzrPublicationSchema.shape.startingCommit.optional(),
+}).refine(body => (body.taskBranch === undefined) === (body.startingCommit === undefined), {
+  message: "Publisher launches require both the approved task branch and starting commit",
 });
 
 const sourceRequest = context.extend({
   issueId: uuid, runId: uuid, revisionId: uuid,
-  startingCommit: z.string().regex(/^[a-f0-9]{40}$/),
+  startingCommit: untzrPublicationSchema.shape.startingCommit,
 });
 const sourceReport = z.object({
   attachmentId: uuid,
@@ -177,6 +181,7 @@ export function untzrIntegrationRoutes(db: Db, storage: StorageService, options:
     if (!metadata.success || metadata.data.provider !== body.provider) throw forbidden("Choose an approved personal AI connection");
     const parsed = untzrExecutionSchema.safeParse({ ...scope, provider: body.provider, method: metadata.data.method,
       connectionId: body.connectionId, grantId: body.grantId, authorizationGeneration: grant?.providerTenant?.authorizationGeneration,
+      publication: body.taskBranch ? { taskBranch: body.taskBranch, startingCommit: body.startingCommit } : undefined,
       stageAgents: Object.fromEntries(stageAgents.map(agent => [
         agent.id, { adapter: agent.adapterType, harness: agentHarnessType(agent.adapterType, agent.adapterConfig) },
       ])), });
@@ -211,7 +216,9 @@ export function untzrIntegrationRoutes(db: Db, storage: StorageService, options:
     await heartbeat.wakeup(body.agentId, { source: "assignment", triggerDetail: "system", reason: "issue_assigned",
       payload: { issueId: issue.id }, contextSnapshot: { issueId: issue.id }, idempotencyKey: handoffId,
       requestedByActorType: "user", requestedByActorId: scope.userId });
-    res.status(202).json({ issueId: issue.id, identifier: issue.identifier });
+    const pinned = untzrExecutionSchema.parse(issue.untzrExecution);
+    res.status(202).json({ issueId: issue.id, identifier: issue.identifier,
+      authorizationGeneration: pinned.authorizationGeneration ?? pinned.grantId });
   });
   router.post("/source", validate(sourceRequest), async (req, res) => {
     const body = sourceRequest.parse(req.body);
@@ -226,6 +233,8 @@ export function untzrIntegrationRoutes(db: Db, storage: StorageService, options:
     const execution = untzrExecutionSchema.parse(issue.untzrExecution);
     if (execution.subject !== scope.subject || execution.userId !== scope.userId)
       throw forbidden("Untzr source belongs to another user");
+    if (execution.publication && execution.publication.startingCommit !== body.startingCommit)
+      throw conflict("Untzr source is outside the approved starting commit");
 
     const [source] = await db.select({
       runId: heartbeatRuns.id, issueId: heartbeatRuns.issueId, nativeIssueId: heartbeatRuns.nativeIssueId,
@@ -276,6 +285,7 @@ export function untzrIntegrationRoutes(db: Db, storage: StorageService, options:
       throw conflict("Untzr source attachment integrity check failed");
     res.json({ issueId: issue.id, runId: source.runId, revisionId: revision.id,
       repositoryId: execution.repositoryId, repository: execution.repository,
+      authorizationGeneration: execution.authorizationGeneration ?? execution.grantId,
       ...report, sourceBase64: bytes.toString("base64") });
   });
   return router;

@@ -24,6 +24,11 @@ const scopeSchema = z.object({
   agentIds: z.array(uuid).min(1),
 }).strict();
 
+export const untzrPublicationSchema = z.object({
+  taskBranch: z.string().regex(/^untzr\/[a-f0-9]{16}$/),
+  startingCommit: z.string().regex(/^[a-f0-9]{40}$/),
+}).strict();
+
 export const untzrExecutionSchema = scopeSchema.omit({ agentIds: true }).extend({
   stageAgents: z.record(uuid, z.object({ adapter: z.literal("paperclip_runner"), harness: z.enum(["codex_local", "claude_local"]) }).strict()),
   provider: untzrProviderSchema,
@@ -31,6 +36,7 @@ export const untzrExecutionSchema = scopeSchema.omit({ agentIds: true }).extend(
   connectionId: uuid,
   grantId: uuid,
   authorizationGeneration: uuid.optional(),
+  publication: untzrPublicationSchema.optional(),
 }).strict();
 export type UntzrExecution = z.infer<typeof untzrExecutionSchema>;
 

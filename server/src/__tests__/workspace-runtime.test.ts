@@ -722,6 +722,25 @@ describe("refreshRemoteTrackingBaseRef git auth", () => {
     expect(await readGit(repoRoot, ["rev-parse", "origin/master"])).toBe(expected);
   });
 
+  it("stops before creating a scoped worktree when the approved task branch moved", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const branch = "untzr/0123456789abcdef";
+    const baseRef = `refs/remotes/origin/${branch}`;
+    const startingCommit = await readGit(repoRoot, ["rev-parse", "origin/master"]);
+    await runGit(sourceRepo, ["push", remotePath, `HEAD:refs/heads/${branch}`]);
+    const approved = Object.assign(async () => ({
+      configArgs: [], env: { GIT_TERMINAL_PROMPT: "0" }, source: "managed_connection",
+    }), { requireScopedCheckout: true, expectedCheckout: { baseRef, sha: startingCommit } });
+
+    const workspace = await realizeWorktreeForTest(repoRoot, baseRef, approved);
+    expect(workspace.baseRefSha).toBe(startingCommit);
+    const moved = await advanceRemoteMaster(sourceRepo, remotePath, "branch-moved.txt");
+    await runGit(sourceRepo, ["push", remotePath, `HEAD:refs/heads/${branch}`]);
+    await expect(realizeWorktreeForTest(repoRoot, baseRef, approved)).rejects.toThrow("approved Untzr starting commit");
+    expect(await readGit(repoRoot, ["rev-parse", baseRef])).toBe(moved);
+    expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(startingCommit);
+  });
+
   it("attributes a failed authenticated fetch to the credential that was used", async () => {
     const { repoRoot } = await createClonedRepoWithRemote();
     await runGit(repoRoot, ["remote", "set-url", "origin", path.join(os.tmpdir(), "paperclip-missing-remote", "repo.git")]);

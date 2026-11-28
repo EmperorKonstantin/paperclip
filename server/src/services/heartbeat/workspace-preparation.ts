@@ -240,7 +240,22 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
     environmentResolution,
     resolvedInstanceSettings,
   } = input.environment;
-  const { mergedConfig, configSnapshot, secretManifest } = input.config;
+  const { configSnapshot, secretManifest } = input.config;
+  const untzrBinding = issueId ? await readUntzrIssueExecution(db, agent.companyId, issueId) : null;
+  const publication = untzrBinding?.execution.publication;
+  const expectedCheckout = publication ? {
+    baseRef: `refs/remotes/origin/${publication.taskBranch}`,
+    sha: publication.startingCommit,
+  } : undefined;
+  const mergedConfig = expectedCheckout ? {
+    ...input.config.mergedConfig,
+    workspaceStrategy: {
+      ...parseObject(input.config.mergedConfig.workspaceStrategy),
+      type: "git_worktree",
+      baseRef: expectedCheckout.baseRef,
+      existingBranch: undefined,
+    },
+  } : input.config.mergedConfig;
   let {
     requestedShouldReuseExisting,
     existingExecutionWorkspace,
@@ -984,7 +999,7 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
   });
   // The run-scoped provider resolves the active identity at each Git operation,
   // including base-ref refreshes, workspace realization, and restore.
-  const requireScopedCheckout = issueId ? Boolean(await readUntzrIssueExecution(db, agent.companyId, issueId)) : false;
+  const requireScopedCheckout = Boolean(untzrBinding);
   const workspaceGitAuthProvider = createGitRemoteAuthProvider(
     db,
     agent.companyId,
@@ -996,6 +1011,7 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
       requireScopedCheckout,
     },
   );
+  workspaceGitAuthProvider.expectedCheckout = expectedCheckout;
   if (freshNeedsSeed && issueId && !pluginPrepared && !pluginTaskWorkspace && !remoteAuthority) {
     await controllerLease.assertOwned();
     const verifySourceAccess = async () => {
@@ -1131,6 +1147,11 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
         }),
     },
   ));
+  if (publication && (remoteAuthority || pluginPrepared || executionWorkspace.strategy !== "git_worktree" ||
+      executionWorkspace.baseRefSha !== publication.startingCommit)) {
+    throw new WorkspaceValidationFailure("The managed Git checkout does not match the approved Untzr starting commit.",
+      { reason: "untzr_starting_commit_mismatch" });
+  }
   if (!remoteAuthority && input.task.freshWorkspace?.mode === "fresh_isolated_workspace" && issueId) {
     const recoveredFiles = providerFresh ? providerFresh.recoverySnapshots.map(snapshot => ({
       operationId: snapshot.operationId, sourceRunId: snapshot.sourceRunId,
