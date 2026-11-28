@@ -3571,6 +3571,20 @@
       "when": 1795672447820,
       "tag": "0511_untzr_github_handoff",
       "breakpoints": true
+    },
+    {
+      "idx": 512,
+      "version": "7",
+      "when": 1795846987896,
+      "tag": "0512_untzr_personal_execution",
+      "breakpoints": true
+    },
+    {
+      "idx": 513,
+      "version": "7",
+      "when": 1795856236674,
+      "tag": "0513_regular_kate_bishop",
+      "breakpoints": true
     }
   ]
 }

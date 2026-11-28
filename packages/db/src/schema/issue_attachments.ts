@@ -1,4 +1,4 @@
-import { pgTable, uuid, timestamp, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { boolean, pgTable, uuid, timestamp, index, uniqueIndex } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { issues } from "./issues.js";
 import { assets } from "./assets.js";
@@ -13,6 +13,7 @@ export const issueAttachments = pgTable(
     issueId: uuid("issue_id").notNull().references(() => issues.id, { onDelete: "cascade" }),
     assetId: uuid("asset_id").notNull().references(() => assets.id, { onDelete: "cascade" }),
     issueCommentId: uuid("issue_comment_id").references(() => issueComments.id, { onDelete: "set null" }),
+    signedUntzrSource: boolean("signed_untzr_source").default(false).notNull(),
     originatingRunId: uuid("originating_run_id").references(() => heartbeatRuns.id, {
       onDelete: "set null",
     }),

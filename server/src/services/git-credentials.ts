@@ -12,6 +12,7 @@ import {
 } from "@paperclipai/db";
 import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { isGitHubDotCom } from "./github-fetch.js";
+import { forbidden } from "../errors.js";
 import { secretService } from "./secrets.js";
 import { githubAppTaskCheckout } from "./github-app-credentials.js";
 import { toolAccessService } from "./tool-access.js";
@@ -66,11 +67,13 @@ export type GitAuthInvocation = {
 };
 
 /**
- * Resolve auth for one remote URL. Returns null when the URL is out of scope (non-GitHub,
- * ssh, or already credentialed) or when no token is available — callers then run git with
- * ambient behavior, exactly as before this module existed.
+ * Resolve auth for one remote URL. A required checkout only accepts the task's
+ * scoped App credential. Other checkouts can keep their existing ambient behavior.
  */
-export type GitRemoteAuthProvider = (remoteUrl: string) => Promise<GitAuthInvocation | null>;
+export type GitRemoteAuthProvider = ((remoteUrl: string) => Promise<GitAuthInvocation | null>) & {
+  requireScopedCheckout?: boolean;
+  expectedCheckout?: { baseRef: string; sha: string };
+};
 
 /**
  * True only for `https://github.com/...` (or `www.`) URLs without inline userinfo. GHES and
@@ -278,6 +281,8 @@ export function createGitRemoteAuthProvider(
     heartbeatRunId?: string | null;
     responsibleUserId?: string | null;
     agentId?: string | null;
+    requireScopedCheckout?: boolean;
+    expectedCheckout?: GitRemoteAuthProvider["expectedCheckout"];
   },
   deps?: {
     secrets?: GitCredentialSecretsDeps;
@@ -288,6 +293,8 @@ export function createGitRemoteAuthProvider(
   const secrets: GitCredentialSecretsDeps = deps?.secrets ?? secretService(db);
   const env = deps?.env ?? process.env;
   const secretNames = deps?.secretNames ?? DEFAULT_GITHUB_TOKEN_SECRET_NAMES;
+  const expectedCheckout = context?.expectedCheckout;
+  const requireScopedCheckout = context?.requireScopedCheckout === true || Boolean(expectedCheckout);
   let credentialPromise: Promise<GitCredential | null> | null = null;
 
   const resolveCredential = async (): Promise<GitCredential | null> => {
@@ -326,12 +333,33 @@ export function createGitRemoteAuthProvider(
     return null;
   };
 
-  return async (remoteUrl: string) => {
-    if (!isSupportedGitHubRemoteUrl(remoteUrl)) return null;
-    if (db && context?.issueId && env.PAPERCLIP_GITHUB_APP_PROJECTS) {
+  const resolve: GitRemoteAuthProvider = async (remoteUrl: string) => {
+    if (!isSupportedGitHubRemoteUrl(remoteUrl)) {
+      const issueId = context?.issueId;
+      const boundIssue = !requireScopedCheckout && db && issueId
+        ? await import("./untzr-execution.js").then(
+            ({ readUntzrIssueExecution }) => readUntzrIssueExecution(db, companyId, issueId),
+          )
+        : null;
+      if (requireScopedCheckout || boundIssue) {
+        throw forbidden("Scoped Git checkout requires an approved GitHub remote.");
+      }
+      return null;
+    }
+    if (requireScopedCheckout && (!context?.issueId || !context.heartbeatRunId || !context.agentId)) {
+      throw forbidden("Scoped Git checkout requires the approved task run.");
+    }
+    if (db && context?.heartbeatRunId) {
+      const { assertUntzrGitHubWriteAllowed } = await import("./untzr-execution.js");
+      await assertUntzrGitHubWriteAllowed(db, companyId, {
+        issueId: context.issueId, runId: context.heartbeatRunId, agentId: context.agentId,
+      }, { allowCheckoutForIssue: true });
+    }
+    if (db && context?.issueId) {
       const token = await githubAppTaskCheckout(db, companyId, context.issueId, context.agentId, remoteUrl, env);
       if (token) return buildGitAuthInvocation({ token, source: "managed_connection", secretName: null });
     }
+    if (requireScopedCheckout) throw forbidden("Scoped Git checkout authorization is unavailable.");
     if (db && context?.heartbeatRunId && context.agentId) {
       const [run] = await db.select({ contextId: heartbeatRuns.activeIdentityContextId }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, context.heartbeatRunId), eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, context.agentId),
@@ -358,6 +386,7 @@ export function createGitRemoteAuthProvider(
     if (!credential) return null;
     return buildGitAuthInvocation(credential);
   };
+  return Object.assign(resolve, { requireScopedCheckout, expectedCheckout });
 }
 
 export async function resolveManagedGitHubIdentitySelection(
@@ -547,6 +576,12 @@ export async function resolveManagedGitHubCredential(
     explicitGrantId?: string;
   },
 ): Promise<{ configured: boolean; identitySource?: "personal" | "dedicated"; credential?: GitCredential; error?: string }> {
+  if (context.issueId || context.heartbeatRunId) {
+    const { assertUntzrGitHubWriteAllowed } = await import("./untzr-execution.js");
+    await assertUntzrGitHubWriteAllowed(db, companyId, {
+      issueId: context.issueId, runId: context.heartbeatRunId, agentId: context.agentId,
+    });
+  }
   const selection = await resolveManagedGitHubIdentitySelection(db, companyId, context);
   if (!selection.configured) return { configured: false };
   if (!selection.grant) return { configured: true, identitySource: selection.identitySource, error: selection.error };

@@ -13,7 +13,7 @@ import {
 import type { ProjectGitAuthorization } from "@paperclipai/shared";
 import { forbidden, notFound } from "../errors.js";
 import { resolveManagedGitHubCredential } from "./git-credentials.js";
-import { githubAppProjectBinding, scopedGitHubAppCredential } from "./github-app-credentials.js";
+import { githubAppProjectBinding, githubAppTaskCheckout, scopedGitHubAppCredential } from "./github-app-credentials.js";
 import { resolveGitHubOperationCredentials } from "./github-operation-credentials.js";
 import { normalizeProjectRepositoryUrl, projectRepositoryIsPrivate } from "./project-repositories.js";
 import { recordProjectLifecycleEvent } from "./resource-lifecycle-events.js";
@@ -23,6 +23,7 @@ import { assertTaskWorkspaceExecutionAccess, assertTaskWorkspaceSourceProjectAcc
 import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
 import { isCloudManagedInstance } from "./cloud-instance.js";
 import { isCurrentCloudOwnerInstanceAdmin, loadCurrentCloudOwnerAuthority } from "./cloud-tenant-authority.js";
+import { assertUntzrGitHubWriteAllowed } from "./untzr-execution.js";
 
 function transientGitToken(token: string | undefined): string {
   if (!token || token.length > 4096 || /[\0\r\n]/.test(token) || token.startsWith("secret://")) {
@@ -169,7 +170,6 @@ export function projectGitAuthorizationService(db: Db) {
       const repo = normalizeProjectRepositoryUrl(workspace.repoUrl);
       if (input.expectedRepository && repo.fullName.toLowerCase() !== input.expectedRepository.toLowerCase())
         throw forbidden("Project repository changed before GitHub authorization");
-      const isPrivate = await projectRepositoryIsPrivate(db, input.companyId, workspace);
       if (scope.runId || scope.agentId) {
         if (!scope.runId || !scope.agentId) throw forbidden("Incomplete foreground Git identity");
         const [run] = await db
@@ -193,7 +193,12 @@ export function projectGitAuthorizationService(db: Db) {
         const [issue] =
           typeof issueId === "string"
             ? await db
-                .select({ executionWorkspaceId: issues.executionWorkspaceId })
+                .select({
+                  executionWorkspaceId: issues.executionWorkspaceId,
+                  projectId: issues.projectId,
+                  projectWorkspaceId: issues.projectWorkspaceId,
+                  untzrExecution: issues.untzrExecution,
+                })
                 .from(issues)
                 .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)))
             : [];
@@ -206,7 +211,19 @@ export function projectGitAuthorizationService(db: Db) {
         }, input.companyId, {
           issueId, workspaceId: issue.executionWorkspaceId, projectWorkspaceId: workspace.id,
         });
-        if (!isPrivate) return null;
+        if (issue.untzrExecution) {
+          if (scope.operation !== "prepare" || scope.workspaceId !== workspace.id ||
+              issue.projectId !== input.projectId || issue.projectWorkspaceId !== workspace.id) {
+            throw forbidden("Untzr checkout requires the approved foreground project workspace");
+          }
+          await assertUntzrGitHubWriteAllowed(db, input.companyId, {
+            issueId, runId: scope.runId, agentId: scope.agentId,
+          }, { allowCheckoutForIssue: true });
+          return transientGitToken(await githubAppTaskCheckout(
+            db, input.companyId, issueId, scope.agentId, workspace.repoUrl,
+          ));
+        }
+        if (!(await projectRepositoryIsPrivate(db, input.companyId, workspace))) return null;
         const result = await resolveGitHubOperationCredentials(db, {
           companyId: input.companyId,
           runId: scope.runId,
@@ -215,6 +232,7 @@ export function projectGitAuthorizationService(db: Db) {
         if (result.status !== "available") throw forbidden(result.reason ?? "Run GitHub authorization unavailable");
         return transientGitToken(result.env.PAPERCLIP_GIT_TOKEN);
       }
+      const isPrivate = await projectRepositoryIsPrivate(db, input.companyId, workspace);
       const appBinding = githubAppProjectBinding(input.companyId, input.projectId);
       if (appBinding) {
         if (scope.workspaceId !== workspace.id || row.archivedAt || row.visibility !== "private"

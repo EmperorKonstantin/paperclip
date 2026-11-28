@@ -169,7 +169,10 @@ export type GitRemoteAuthInvocation = {
   secretName?: string | null;
 };
 
-export type GitRemoteAuthProvider = (remoteUrl: string) => Promise<GitRemoteAuthInvocation | null>;
+export type GitRemoteAuthProvider = ((remoteUrl: string) => Promise<GitRemoteAuthInvocation | null>) & {
+  requireScopedCheckout?: boolean;
+  expectedCheckout?: { baseRef: string; sha: string };
+};
 
 export interface ExecutionWorkspaceIssueRef {
   id: string;
@@ -1050,17 +1053,24 @@ async function refreshRemoteTrackingBaseRefWithDiagnostic(
       return value.trim() || null;
     })
     .catch(() => { diagnostic.remoteLookup = "failed"; return null; });
-  if (!remoteUrl) return { warnings: [], diagnostic };
+  if (!remoteUrl) {
+    if (resolveGitAuth?.requireScopedCheckout) throw new Error("Scoped Git checkout requires a configured repository remote.");
+    return { warnings: [], diagnostic };
+  }
 
   const auth = resolveGitAuth ? await resolveGitAuth(remoteUrl).then((value) => {
     diagnostic.authLookup = value ? "resolved" : "unavailable";
     return value;
   }).catch(() => { diagnostic.authLookup = "failed"; return null; }) : null;
+  if (resolveGitAuth?.requireScopedCheckout && !auth) {
+    throw new Error("Scoped Git checkout authorization is unavailable.");
+  }
   try {
     await runGit([
       ...(auth?.configArgs ?? []),
       "fetch",
       "--prune",
+      ...(resolveGitAuth?.requireScopedCheckout ? ["--no-recurse-submodules"] : []),
       remoteTracking.remote,
       `+refs/heads/${remoteTracking.branch}:refs/remotes/${remoteTracking.remote}/${remoteTracking.branch}`,
     ], repoRoot, {
@@ -2814,6 +2824,7 @@ async function readAdvertisedDefaultBranch(repoRoot: string, resolveGitAuth?: Gi
   try {
     const remoteUrl = await runGit(["remote", "get-url", "origin"], repoRoot);
     const auth = resolveGitAuth ? await resolveGitAuth(remoteUrl) : null;
+    if (resolveGitAuth?.requireScopedCheckout && !auth) return null;
     const output = await new Promise<string>((resolve, reject) => {
       execFile("git", [...(auth?.configArgs ?? []), "ls-remote", "--symref", "origin", "HEAD"], {
         cwd: repoRoot, timeout: 10_000, maxBuffer: 64 * 1024,
@@ -3452,6 +3463,25 @@ async function resolveGitRepoRootForWorkspaceCleanup(
   return path.dirname(resolvedGitDir);
 }
 
+function assertExpectedGitCheckout(
+  expected: GitRemoteAuthProvider["expectedCheckout"],
+  baseRef: string | null,
+  sha: string | null,
+  fetchWarnings: string[],
+) {
+  if (expected && (baseRef !== expected.baseRef || sha !== expected.sha || fetchWarnings.length > 0)) {
+    throw new WorkspaceRuntimeValidationFailure("The managed Git checkout does not match the approved Untzr starting commit.",
+      { workspaceValidation: { reason: "untzr_starting_commit_mismatch" } });
+  }
+}
+
+export async function verifyExpectedGitCheckout(repoRoot: string, provider: GitRemoteAuthProvider) {
+  const expected = provider.expectedCheckout;
+  if (!expected) return;
+  const warnings = await refreshRemoteTrackingBaseRef(repoRoot, expected.baseRef, provider);
+  assertExpectedGitCheckout(expected, expected.baseRef, await resolveBaseRefSha(repoRoot, expected.baseRef), warnings);
+}
+
 export async function realizeExecutionWorkspace(input: {
   db?: Db | null;
   base: ExecutionWorkspaceInput;
@@ -3570,6 +3600,7 @@ export async function realizeExecutionWorkspace(input: {
     ...(baseRefAlreadyRefreshed ? [] : await refreshRemoteTrackingBaseRef(repoRoot, baseRef, input.resolveGitAuth)),
   ];
   const currentBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
+  assertExpectedGitCheckout(input.resolveGitAuth?.expectedCheckout, baseRef, currentBaseRefSha, baseRefreshWarnings);
 
   await fs.mkdir(worktreeParentDir, { recursive: true });
 
@@ -4044,6 +4075,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     await restoreGitWorkspaceContents({ cwd, companyId: input.agent.companyId, workspaceId: input.workspace.id,
       projectId: input.workspace.projectId, contents: restoration.contents, resolveGitAuth: async url => {
         const auth = await input.resolveGitAuth?.(url);
+        if (!auth && input.resolveGitAuth?.requireScopedCheckout) throw new GitCacheRestorationFailure();
         if (!auth) return null;
         const source = auth.source;
         if (source !== "company_secret" && source !== "managed_connection" && source !== "server_env") throw new GitCacheRestorationFailure();
@@ -4116,6 +4148,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       ? await refreshRemoteTrackingBaseRef(repoRoot, reuseBaseRef, input.resolveGitAuth)
       : [];
     const currentBaseRefSha = reuseBaseRef ? await resolveBaseRefSha(repoRoot, reuseBaseRef) : null;
+    assertExpectedGitCheckout(input.resolveGitAuth?.expectedCheckout, reuseBaseRef, currentBaseRefSha, baseRefreshWarnings);
     // An unstarted-worktree refresh can fast-forward the checked-out branch.
     // Never run it for an attached operator-owned ref.
     const refresh = !savedCommit && realized.branchCreatedByRuntime && reuseBaseRef && currentBaseRefSha
@@ -4165,6 +4198,14 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     throw new Error(`Execution workspace "${cwd}" is missing and cannot be restored because no branch name is recorded.`);
   }
 
+  const restoreBaseRef = savedCommit && !input.resolveGitAuth?.expectedCheckout
+    ? null : input.workspace.baseRef ?? input.base.repoRef ?? null;
+  const restoreRefreshWarnings = restoreBaseRef
+    ? await refreshRemoteTrackingBaseRef(repoRoot, restoreBaseRef, input.resolveGitAuth)
+    : [];
+  const restoreCurrentBaseRefSha = restoreBaseRef ? await resolveBaseRefSha(repoRoot, restoreBaseRef) : null;
+  assertExpectedGitCheckout(input.resolveGitAuth?.expectedCheckout, restoreBaseRef, restoreCurrentBaseRefSha, restoreRefreshWarnings);
+
   await persistContentsRestoredAt(null);
   await fs.mkdir(path.dirname(worktreePath), { recursive: true });
   await runGit(["worktree", "prune"], repoRoot).catch(() => {});
@@ -4180,12 +4221,6 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     // still prevents a clean resumed worktree from refreshing to upstream HEAD.
     if (existingTip && existingTip !== savedCommit && !restoration?.restored) throw new GitCacheRestorationFailure();
   }
-  const restoreBaseRef = savedCommit ? null : input.workspace.baseRef ?? input.base.repoRef ?? null;
-  const restoreRefreshWarnings = restoreBaseRef
-    ? await refreshRemoteTrackingBaseRef(repoRoot, restoreBaseRef, input.resolveGitAuth)
-    : [];
-  const restoreCurrentBaseRefSha = restoreBaseRef ? await resolveBaseRefSha(repoRoot, restoreBaseRef) : null;
-
   let created = false;
   try {
     await recordGitOperation(input.recorder, {
@@ -4217,7 +4252,8 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         `Execution workspace "${worktreePath}" cannot be restored because its operator-owned branch "${branchName}" no longer exists.`,
       );
     }
-    const baseRef = savedCommit ?? input.workspace.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
+    const baseRef = savedCommit ?? input.workspace.baseRef ?? input.resolveGitAuth?.expectedCheckout?.baseRef
+      ?? await detectDefaultBranch(repoRoot, input.resolveGitAuth) ?? "HEAD";
     const recreatedBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",

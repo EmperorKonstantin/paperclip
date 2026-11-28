@@ -1,3 +1,19 @@
+import { Readable } from "node:stream";
+import { untzrIntegrationRoutes } from "../routes/untzr-integration.js";
+import { errorHandler } from "../middleware/error-handler.js";
+import { createLocalAgentJwt } from "../agent-auth-jwt.js";
+import { actorMiddleware } from "../middleware/auth.js";
+import { issueRoutes } from "../routes/issues.js";
+import { createStorageService } from "../storage/service.js";
+import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.js";
+import { projectGitAuthorizationService } from "../services/project-git-authorization.js";
+import { issueService } from "../services/issues.js";
+import { documentService } from "../services/documents.js";
+import * as aiApiKeyTest from "../services/ai-api-key-test.js";
+import { createGitRemoteAuthProvider } from "../services/git-credentials.js";
+import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
+import { githubAppTaskCheckout } from "../services/github-app-credentials.js";
+import * as checkoutBroker from "../services/github-checkout-broker.js";
 import { completeSetupTokenAiConnection } from "../services/setup-token-ai-connection.js";
 import { connectionIntentService } from "../services/connection-intents.js";
 import { connectionIntentDeliveryService } from "../services/connection-intent-delivery.js";
@@ -17,7 +33,7 @@ import { mkdtemp, realpath, rm, access, readFile, writeFile, stat } from "node:f
 import os from "node:os";
 import path from "node:path";
 import { and, eq, sql } from "drizzle-orm";
-import { createDb, type Db, activityLog, companies, agents, agentTaskSessions, heartbeatRuns, companyMemberships, connectionGrants, toolApplications, connectionGrantDelegations, connectionGrantMembers, toolConnections, toolConnectionInstalls, aiConnectionDefaults, aiProviderDefaults, adapterAuthSessions, environments, plugins, issues, issueThreadInteractions, issueRecoveryActions, connectionIntentDeliveries, agentWakeupRequests, companySecrets, companySecretVersions, secretAccessEvents, userSecretDefinitions, principalPermissionGrants } from "@paperclipai/db";
+import { createDb, type Db, activityLog, agentApiKeys, assets, authUsers, companies, agents, projects, projectAccessMembers, projectWorkspaces, agentTaskSessions, heartbeatRuns, companyMemberships, connectionGrants, toolApplications, connectionGrantDelegations, connectionGrantMembers, toolConnections, toolConnectionInstalls, aiConnectionDefaults, aiProviderDefaults, adapterAuthSessions, environments, plugins, issues, issueThreadInteractions, issueRecoveryActions, connectionIntentDeliveries, agentWakeupRequests, companySecrets, companySecretVersions, secretAccessEvents, userSecretDefinitions, principalPermissionGrants } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { fetchCompanyQuotaWindows } from "../services/quota-windows.js";
 import { quotaCredentialRecoveryPath, quotaCredentialRecovery, quotaCredentialHash } from "../services/quota-credential-recovery.js";
@@ -37,6 +53,7 @@ import { execute as executeGemini, testEnvironment as testGeminiEnvironment } fr
 import { toolAccessService } from "../services/tool-access.js";
 import { secretService } from "../services/secrets.js";
 import { resolveExecutionRunAdapterConfig } from "../services/heartbeat.js";
+import * as heartbeatModule from "../services/heartbeat.js";
 import { aiConnectionBindingSchema, connectionPurposeTransportSchema, isAiConnectionCompatible } from "@paperclipai/shared";
 import { openRouterClaudeHeaders } from "@paperclipai/shared/openrouter-attribution";
 import { createServer } from "node:http";
@@ -82,6 +99,432 @@ beforeAll(async () => {
 afterAll(async () => { await database?.cleanup(); vi.unstubAllEnvs(); if (home) await rm(home, { recursive: true, force: true }); });
 
 describe("managed AI connections", () => {
+  it("keeps pinned personal execution grants isolated across concurrent users and revocation", async () => {
+    const users = ["untzr-alice", "untzr-bob"];
+    await db.insert(companyMemberships).values(users.map(principalId => ({
+      companyId, principalId, principalType: "user", status: "active", membershipRole: "member",
+    })));
+    const [alice, bob] = await Promise.all(users.map(userId => create(userId, userId)));
+    const select = (userId: string, pinnedPersonalGrant: typeof alice) =>
+      aiConnectionService(db).select({ ...input, userId, pinnedPersonalGrant, allowUninstalledPersonal: true });
+
+    const selected = await Promise.all([select(users[0], alice), select(users[1], bob)]);
+    expect(selected.map(result => result.attribution.connectionId)).toEqual([alice.connectionId, bob.connectionId]);
+    await expect(select(users[0], bob)).rejects.toThrow();
+    await expect(select(users[0], { ...alice, connectionId: bob.connectionId })).rejects.toThrow();
+    await expect(service.select({ ...input, companyId: otherCompanyId, userId: users[0],
+      pinnedPersonalGrant: alice, allowUninstalledPersonal: true })).rejects.toThrow();
+
+    await db.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.id, alice.grantId));
+    await expect(select(users[0], alice)).rejects.toThrow();
+    await expect(select(users[1], bob)).resolves.toMatchObject({ attribution: { grantId: bob.grantId } });
+  });
+
+  it("preserves active rotation and invalidates queued Untzr authorization after reconnect", async () => {
+    const userId = "untzr-rotation";
+    await db.insert(companyMemberships).values({
+      companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member",
+    });
+    const saved = await create(userId, userId);
+    const select = (pinnedPersonalGrant: typeof saved & { authorizationGeneration?: string }) =>
+      service.select({ ...input, userId, pinnedPersonalGrant, allowUninstalledPersonal: true });
+    const reconnect = { ...binding, ownership: "personal" as const, name: userId, apiKey: "fixture",
+      agentIds: [], allAgents: true, connectionId: saved.connectionId };
+
+    await service.save(companyId, userId, reconnect, "fixture-rotated");
+    expect(await service.credential(await select(saved))).toBe("fixture-rotated");
+
+    await db.update(connectionGrants).set({ status: "revoked", revokedAt: new Date(), updatedAt: new Date() })
+      .where(eq(connectionGrants.id, saved.grantId));
+    await expect(select(saved)).rejects.toThrow("Reconnect");
+    await service.save(companyId, userId, reconnect, "fixture-reconnected");
+    await expect(select(saved)).rejects.toThrow("authorization");
+    const current = await service.select({ ...input, userId });
+    const authorizationGeneration = current.grant.providerTenant?.authorizationGeneration;
+    expect(authorizationGeneration).toEqual(expect.any(String));
+    expect(await service.credential(await select({ ...saved, authorizationGeneration }))).toBe("fixture-reconnected");
+  });
+
+  it("launches an Untzr successor at the published commit with the same personal grant", async () => {
+    const users = ["untzr-publisher-alice", "untzr-publisher-bob"];
+    const now = new Date();
+    await db.insert(authUsers).values(users.map(id => ({
+      id, name: id, email: `${id}@example.test`, createdAt: now, updatedAt: now,
+    })));
+    await db.insert(companyMemberships).values(users.map(principalId => ({
+      companyId, principalId, principalType: "user", status: "active", membershipRole: "owner",
+    })));
+    const grants = await Promise.all(users.map(id => create(id, id)));
+    const [project] = await db.insert(projects).values({
+      companyId, name: "Publisher test", visibility: "private",
+      executionWorkspacePolicy: { enabled: true, allowIssueOverride: true, defaultMode: "isolated_workspace",
+        workspaceStrategy: { type: "git_worktree" } },
+    }).returning();
+    const repository = "example/publisher-fixture";
+    const [workspace] = await db.insert(projectWorkspaces).values({
+      companyId, projectId: project.id, name: "Checkout", repoUrl: `https://github.com/${repository}.git`, repoRef: "main",
+      metadata: { githubRepositoryId: "83", githubRepositoryPrivate: true, githubRepositoryUrl: `https://github.com/${repository}` },
+    }).returning();
+    const stages = await db.insert(agents).values(["Implement", "Review"].map(name => ({
+      companyId, name: `Publisher ${name}`, adapterType: "paperclip_runner" as const,
+      adapterConfig: { provider: "acpx", acpxAgent: "claude" },
+    }))).returning();
+    await db.insert(projectAccessMembers).values([
+      ...users.map(subjectId => ({ companyId, projectId: project.id, subjectType: "user" as const, subjectId })),
+      ...stages.map(({ id: subjectId }) => ({ companyId, projectId: project.id, subjectType: "agent" as const, subjectId })),
+    ]);
+    const integrationKey = "fixture-untzr-publisher-only-key";
+    const scopes = JSON.stringify(users.map(userId => ({
+      companyId, projectId: project.id, workspaceId: workspace.id, repositoryId: "83", repository, ref: "main",
+      userId, subject: userId, agentIds: stages.map(agent => agent.id),
+    })));
+    const previousScopes = process.env.PAPERCLIP_UNTZR_SCOPES;
+    const previousKey = process.env.PAPERCLIP_UNTZR_INTEGRATION_KEY_SHA256;
+    const previousProjects = process.env.PAPERCLIP_GITHUB_APP_PROJECTS;
+    vi.stubEnv("PAPERCLIP_UNTZR_SCOPES", scopes);
+    vi.stubEnv("PAPERCLIP_GITHUB_APP_PROJECTS", JSON.stringify([{
+      companyId, projectId: project.id, workspaceId: workspace.id, repositoryId: "83", agentIds: stages.map(agent => agent.id),
+    }]));
+    vi.stubEnv("PAPERCLIP_UNTZR_INTEGRATION_KEY_SHA256", createHash("sha256").update(integrationKey).digest("hex"));
+    const settings = settingsModule.instanceSettingsService(db);
+    const previous = await settings.getExperimental();
+    await settings.updateExperimental({ enableIsolatedWorkspaces: true });
+    const realHeartbeatService = heartbeatModule.heartbeatService;
+    const wakeup = vi.fn();
+    const mockedHeartbeat = vi.spyOn(heartbeatModule, "heartbeatService").mockImplementation((...args) => ({
+      ...realHeartbeatService(...args), wakeup,
+    }));
+    const validateKey = vi.spyOn(aiApiKeyTest, "validateAiApiKey").mockResolvedValue(undefined);
+    try {
+      const storage = createStorageService(createLocalDiskStorageProvider(path.join(home, "launch-test-storage")));
+      const app = express();
+      app.use(express.json());
+      app.use(untzrIntegrationRoutes(db, storage, { deploymentMode: "local_trusted" }));
+      app.use(errorHandler);
+      const taskBranch = "untzr/0123456789abcdef";
+      const startingCommit = "a".repeat(40);
+      const launch = (user: number, body = {}) => request(app).post("/launch")
+        .set("Authorization", `Bearer ${integrationKey}`)
+        .send({ subject: users[user], companyId, projectId: project.id, provider: "anthropic", ...grants[user],
+          agentId: stages[0].id, title: "Scoped fixture", requestId: randomUUID(), taskBranch, startingCommit,
+          repositoryId: "83", workspaceId: workspace.id, ...body });
+      await launch(0, { repositoryId: "999" }).expect(403);
+      await launch(0, { workspaceId: randomUUID() }).expect(403);
+      const roots = await Promise.all([launch(0), launch(1)]);
+      for (const root of roots) expect(root.status, String(root.body.error)).toBe(202);
+      expect(roots.map(root => root.body.authorizationGeneration)).toEqual(grants.map(grant => grant.grantId));
+      const rootId = roots[0].body.issueId;
+      const review = {
+        predecessorIssueId: rootId, startingCommit: "b".repeat(40), agentId: stages[1].id, requestId: randomUUID(),
+      };
+      await launch(0, review).expect(403);
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, rootId));
+      await launch(1, review).expect(403);
+      await launch(0, { ...review, taskBranch: "untzr/1123456789abcdef" }).expect(403);
+      const accepted = await launch(0, review).expect(202);
+      expect(accepted.body.authorizationGeneration).toBe(grants[0].grantId);
+      const retry = await launch(0, review).expect(202);
+      expect(retry.body.issueId).toBe(accepted.body.issueId);
+      await launch(0, { ...review, startingCommit: "c".repeat(40) }).expect(409);
+      const [saved] = await db.select().from(issues).where(eq(issues.id, accepted.body.issueId));
+      expect(saved.responsibleUserId).toBe(users[0]);
+      expect(saved.untzrExecution).toMatchObject({
+        ...grants[0], publication: { taskBranch, predecessorIssueId: rootId, startingCommit: review.startingCommit },
+      });
+      expect(wakeup).toHaveBeenCalledWith(stages[1].id, expect.objectContaining({ requestedByActorId: users[0] }));
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, accepted.body.issueId));
+      const releasedCommit = "d".repeat(40);
+      const followUp = {
+        predecessorIssueId: accepted.body.issueId, taskBranch: "untzr/23456789abcdef01",
+        startingCommit: releasedCommit, requestId: randomUUID(), followUp: "true",
+      };
+      await launch(0, followUp).expect(403);
+      const release = (user: number, nextTaskBranch = followUp.taskBranch) => request(app).post("/release")
+        .set("Authorization", `Bearer ${integrationKey}`)
+        .send({ subject: users[user], companyId, projectId: project.id, issueId: accepted.body.issueId,
+          taskBranch, nextTaskBranch, releasedCommit });
+      await release(1).expect(403);
+      const confirmedRelease = await release(0).expect(200);
+      await release(0).expect(200).expect(confirmedRelease.body);
+      await release(0, "untzr/9876543210abcdef").expect(409);
+      await launch(0, { ...followUp, followUp: undefined }).expect(403);
+      await launch(0, { ...followUp, taskBranch }).expect(403);
+      await launch(0, { ...followUp, startingCommit: review.startingCommit }).expect(403);
+      await launch(0, { ...followUp, agentId: stages[1].id }).expect(403);
+      await launch(1, followUp).expect(403);
+      const next = await launch(0, followUp).expect(202);
+      expect(next.body.authorizationGeneration).toBe(grants[0].grantId);
+      await launch(0, followUp).expect(202).expect(next.body);
+      const [nextIssue] = await db.select().from(issues).where(eq(issues.id, next.body.issueId));
+      expect(nextIssue.untzrExecution).toMatchObject({
+        ...grants[0], publication: {
+          taskBranch: followUp.taskBranch, startingCommit: releasedCommit,
+          predecessorIssueId: accepted.body.issueId, implementerAgentId: stages[0].id,
+        },
+      });
+
+      const provisioningId = randomUUID();
+      const keyRequest = (endpoint: string, user: number, body: object) => request(app).post(endpoint)
+        .set("Authorization", `Bearer ${integrationKey}`)
+        .send({ subject: users[user], companyId, projectId: project.id, provider: "anthropic", ...body });
+      const keyBody = { apiKey: "fixture-personal-key", provisioningId };
+      let signalWaiting!: () => void;
+      const waitingAfterLookup = new Promise<void>(resolve => { signalWaiting = resolve; });
+      let resumeFirst!: () => void;
+      const allowFirstSave = new Promise<void>(resolve => { resumeFirst = resolve; });
+      validateKey.mockImplementationOnce(async () => {
+        signalWaiting();
+        await allowFirstSave;
+      });
+      const first = keyRequest("/api-key", 0, keyBody).expect(201).then(response => response);
+      await waitingAfterLookup;
+      const provisioned = await keyRequest("/api-key", 0, keyBody).expect(201).then(response => response).finally(resumeFirst);
+      const duplicate = await first;
+      expect(provisioned.body).toEqual(duplicate.body);
+      expect(provisioned.body).toEqual({
+        connectionId: provisioningId, grantId: expect.any(String), authorizationGeneration: provisioned.body.grantId,
+      });
+      validateKey.mockClear();
+      await keyRequest("/api-key", 0, keyBody).expect(201).expect(provisioned.body);
+      await keyRequest("/api-key", 0, { ...keyBody, apiKey: "fixture-changed-key" }).expect(409);
+      await keyRequest("/api-key", 1, keyBody).expect(409);
+      expect(validateKey).not.toHaveBeenCalled();
+      await keyRequest("/disconnect", 1, { connectionId: provisioningId }).expect(404);
+      await keyRequest("/disconnect", 0, { connectionId: provisioningId }).expect(200);
+      await keyRequest("/disconnect", 0, { connectionId: provisioningId }).expect(200);
+      await keyRequest("/api-key", 0, keyBody).expect(409);
+      await launch(0, { connectionId: provisioningId, grantId: provisioned.body.grantId }).expect(422);
+      const rotated = await keyRequest("/api-key", 0, { apiKey: "fixture-new-key", provisioningId: randomUUID() }).expect(201);
+      expect(rotated.body.authorizationGeneration).not.toBe(provisioned.body.authorizationGeneration);
+    } finally {
+      validateKey.mockRestore();
+      mockedHeartbeat.mockRestore();
+      await settings.updateExperimental({ enableIsolatedWorkspaces: previous.enableIsolatedWorkspaces });
+      vi.stubEnv("PAPERCLIP_UNTZR_SCOPES", previousScopes);
+      vi.stubEnv("PAPERCLIP_UNTZR_INTEGRATION_KEY_SHA256", previousKey);
+      vi.stubEnv("PAPERCLIP_GITHUB_APP_PROJECTS", previousProjects);
+    }
+  });
+
+  it("checks Untzr checkout stage and live grant before requesting GitHub credentials", async () => {
+    const userId = "untzr-checkout";
+    const now = new Date();
+    await db.insert(authUsers).values({ id: userId, name: userId, email: "checkout@example.test", createdAt: now, updatedAt: now });
+    await db.insert(companyMemberships).values({
+      companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "owner",
+    });
+    const grant = await create(userId, userId);
+    const [project] = await db.insert(projects).values({ companyId, name: "Checkout", visibility: "private" }).returning();
+    const repository = "example/checkout";
+    const repoUrl = `https://github.com/${repository}.git`;
+    const [workspace] = await db.insert(projectWorkspaces).values({
+      companyId, projectId: project.id, name: "Checkout", repoUrl, repoRef: "main",
+      metadata: { githubRepositoryId: "42", githubRepositoryPrivate: true, githubRepositoryUrl: `https://github.com/${repository}` },
+    }).returning();
+    const [approved, other] = await db.insert(agents).values(["Approved", "Other"].map(name => ({
+      companyId, name, adapterType: "paperclip_runner" as const, adapterConfig: { provider: "acpx", acpxAgent: "claude" },
+    }))).returning();
+    await db.insert(projectAccessMembers).values([
+      { companyId, projectId: project.id, subjectType: "user", subjectId: userId },
+      { companyId, projectId: project.id, subjectType: "agent", subjectId: approved.id },
+      { companyId, projectId: project.id, subjectType: "agent", subjectId: other.id },
+    ]);
+    const binding = { companyId, projectId: project.id, workspaceId: workspace.id, repositoryId: "42" };
+    const scope = { ...binding, subject: userId, userId, repository, ref: "main" };
+    const [issue] = await db.insert(issues).values({
+      companyId, projectId: project.id, projectWorkspaceId: workspace.id, title: "Git checkout",
+      assigneeAgentId: other.id, untzrExecution: { ...scope, ...grant, provider: "anthropic", method: "api_key",
+        stageAgents: { [approved.id]: { adapter: "paperclip_runner", harness: "claude_local" } },
+        publication: { taskBranch: "untzr/0123456789abcdef", startingCommit: "a".repeat(40) } },
+    }).returning();
+    const checkout = (id: string) => githubAppTaskCheckout(db, companyId, issue.id, id, repoUrl);
+    const previousJwtSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    const previousScopes = process.env.PAPERCLIP_UNTZR_SCOPES;
+    const previousProjects = process.env.PAPERCLIP_GITHUB_APP_PROJECTS;
+    vi.stubEnv("PAPERCLIP_UNTZR_SCOPES", JSON.stringify([{ ...scope, agentIds: [approved.id, other.id] }]));
+    vi.stubEnv("PAPERCLIP_GITHUB_APP_PROJECTS", JSON.stringify([{ ...binding, agentIds: [approved.id, other.id] }]));
+    const broker = vi.spyOn(checkoutBroker, "requestGitHubInstallationCredential").mockResolvedValue("fixture-installation-token");
+    try {
+      await expect(checkout(other.id)).rejects.toThrow("approved Untzr user, agent");
+      await db.update(issues).set({ assigneeAgentId: approved.id }).where(eq(issues.id, issue.id));
+      await expect(checkout(approved.id)).resolves.toBe("fixture-installation-token");
+      expect(broker).toHaveBeenCalledOnce();
+      expect(broker).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ operation: "checkout" }));
+      broker.mockClear();
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId, agentId: approved.id, issueId: issue.id, scopeKind: "issue",
+        status: "running", responsibleUserId: userId,
+      }).returning();
+      const runBinding = { companyId, agentId: approved.id, runId: run.id };
+      await expect(resolveGitHubOperationCredentials(db, runBinding)).rejects.toThrow("Untzr publisher");
+      const lookup = createGitRemoteAuthProvider(db, companyId, {
+        heartbeatRunId: run.id, agentId: approved.id,
+      }, { env: { GH_TOKEN: "fixture-forbidden-fallback" } });
+      await expect(lookup(repoUrl)).rejects.toThrow("Untzr publisher");
+      expect(broker).not.toHaveBeenCalled();
+      const checkoutContext = { issueId: issue.id, heartbeatRunId: run.id, agentId: approved.id };
+      const checkoutLookup = createGitRemoteAuthProvider(db, companyId, {
+        ...checkoutContext, requireScopedCheckout: true,
+      });
+      expect(checkoutLookup.requireScopedCheckout).toBe(true);
+      await expect(checkoutLookup("https://example.test/unsupported.git")).rejects.toThrow("Scoped Git checkout");
+      const baseCheckoutLookup = createGitRemoteAuthProvider(db, companyId, checkoutContext);
+      await expect(baseCheckoutLookup("https://example.test/unsupported.git")).rejects.toThrow("Scoped Git checkout");
+      await expect(checkoutLookup("https://github.com/example/other.git")).rejects.toThrow("approved Untzr repository");
+      expect(broker).not.toHaveBeenCalled();
+      await expect(checkoutLookup(repoUrl)).resolves.toMatchObject({ source: "managed_connection" });
+      expect(broker).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ operation: "checkout" }));
+      broker.mockClear();
+      const provider = projectGitAuthorizationService(db);
+      const providerInput = { ...binding, expectedRepository: repository };
+      const hostScope = { projectId: project.id, workspaceId: workspace.id, operation: "prepare" as const };
+      const foreground = { ...hostScope, runId: run.id, agentId: approved.id };
+      await expect(provider.resolve(providerInput, foreground)).resolves.toBe("fixture-installation-token");
+      expect(broker).toHaveBeenCalledExactlyOnceWith(expect.anything(), expect.objectContaining({
+        operation: "checkout", issueId: issue.id, agentId: approved.id, workspaceId: workspace.id,
+      }));
+      broker.mockClear();
+      await expect(provider.resolve(providerInput, { ...foreground, workspaceId: undefined })).rejects.toThrow();
+      await expect(provider.resolve(providerInput, { ...foreground, operation: "inspect" })).rejects.toThrow();
+      await expect(provider.resolve(providerInput, { ...foreground, agentId: other.id })).rejects.toThrow();
+      await expect(provider.resolve({ ...providerInput, expectedRepository: "example/other" }, foreground)).rejects.toThrow();
+      await expect(provider.resolve(providerInput, { projectId: project.id })).rejects.toThrow();
+      await db.update(heartbeatRuns).set({ responsibleUserId: "bob" }).where(eq(heartbeatRuns.id, run.id));
+      await expect(provider.resolve(providerInput, foreground)).rejects.toThrow();
+      await db.update(heartbeatRuns).set({ responsibleUserId: userId, contextSnapshot: { issueId: randomUUID() } })
+        .where(eq(heartbeatRuns.id, run.id));
+      await expect(provider.resolve(providerInput, foreground)).rejects.toThrow();
+      await db.update(heartbeatRuns).set({ contextSnapshot: {} }).where(eq(heartbeatRuns.id, run.id));
+      expect(broker).not.toHaveBeenCalled();
+      await expect(provider.resolve(providerInput, hostScope)).resolves.toBe("fixture-installation-token");
+      expect(broker).toHaveBeenCalledExactlyOnceWith(expect.anything(), expect.objectContaining({ operation: "checkout" }));
+      broker.mockClear();
+
+      const bytes = Buffer.from("fixture source changes");
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      vi.stubEnv("PAPERCLIP_AGENT_JWT_SECRET", "untzr-source-fixture-jwt-secret");
+      const storage = createStorageService(createLocalDiskStorageProvider(path.join(home, "untzr-source")));
+      const uploads = express();
+      uploads.use(express.json());
+      uploads.use(actorMiddleware(db, { deploymentMode: "authenticated", resolveSession: async () => null }));
+      uploads.use(issueRoutes(db, storage));
+      uploads.use(errorHandler);
+      const [otherRun] = await db.insert(heartbeatRuns).values({
+        companyId, agentId: approved.id, issueId: issue.id, scopeKind: "issue",
+        status: "running", responsibleUserId: userId,
+      }).returning();
+      const upload = (token: string, runId: string) => request(uploads)
+        .post(`/companies/${companyId}/issues/${issue.id}/attachments`)
+        .set("Authorization", `Bearer ${token}`)
+        .set("X-Paperclip-Run-Id", runId)
+        .attach("file", bytes, "source.txt");
+      const agentKey = "fixture-untzr-source-agent-key";
+      await db.insert(agentApiKeys).values({
+        companyId, agentId: approved.id, name: "Source fixture",
+        responsibleUserId: userId, keyHash: createHash("sha256").update(agentKey).digest("hex"),
+      });
+      const signed = (id: string) => createLocalAgentJwt(approved.id, companyId, "paperclip_runner", id, userId)!;
+      const fallback = await upload(agentKey, run.id).expect(201);
+      const otherUpload = await upload(signed(otherRun.id), otherRun.id).expect(201);
+      const signedUpload = await upload(signed(run.id), run.id).expect(201);
+      const attachment = (await issueService(db).getAttachmentById(signedUpload.body.id))!;
+      expect(attachment.originatingRunId).toBe(run.id);
+      const startingCommit = "a".repeat(40);
+      const report = { attachmentId: attachment.id, startingCommit, sha256 };
+      const documents = documentService(db);
+      let baseRevisionId: string | null = null;
+      const writeReport = async (runId: string | null, contents = report) => {
+        const { document } = await documents.upsertIssueDocument({
+          issueId: issue.id, key: "untzr-source", format: "markdown", body: JSON.stringify(contents),
+          createdByAgentId: approved.id, createdByRunId: runId, baseRevisionId,
+        });
+        baseRevisionId = document.latestRevisionId;
+        return baseRevisionId;
+      };
+      const unattributed = await writeReport(null);
+      const writeSignedReport = async (contents = report) => {
+        const response = await request(uploads).put(`/issues/${issue.id}/documents/untzr-source`)
+          .set("Authorization", `Bearer ${signed(run.id)}`)
+          .send({ format: "markdown", body: JSON.stringify(contents), baseRevisionId })
+          .expect(200);
+        baseRevisionId = response.body.latestRevisionId;
+        return response.body.latestRevisionId as string;
+      };
+      const attributed = await writeSignedReport();
+      const alternateRevision = await writeReport(run.id, { sha256, attachmentId: attachment.id, startingCommit });
+      expect(alternateRevision).not.toBe(attributed);
+      const alternateStored = await storage.putFile({
+        companyId, namespace: `issues/${issue.id}`, originalFilename: "alternate-source.txt",
+        contentType: "text/plain", body: bytes,
+      });
+      const alternateAttachment = await issueService(db).createAttachment({
+        issueId: issue.id, ...alternateStored, createdByAgentId: approved.id, createdByRunId: run.id,
+      });
+      expect(alternateAttachment.originatingRunId).toBe(run.id);
+      const alternateAttachmentReport = await writeSignedReport({ ...report, attachmentId: alternateAttachment.id });
+      const fallbackReport = await writeSignedReport({ ...report, attachmentId: fallback.body.id });
+      const otherRunReport = await writeSignedReport({ ...report, attachmentId: otherUpload.body.id });
+      const wrongDigest = await writeSignedReport({ ...report, sha256: "b".repeat(64) });
+      const integrationKey = "fixture-untzr-integration-key-123456";
+      const previousIntegrationKey = process.env.PAPERCLIP_UNTZR_INTEGRATION_KEY_SHA256;
+      vi.stubEnv("PAPERCLIP_UNTZR_INTEGRATION_KEY_SHA256", createHash("sha256").update(integrationKey).digest("hex"));
+      const originalGetObject = storage.getObject.bind(storage);
+      const getObject = vi.spyOn(storage, "getObject");
+      const app = express();
+      app.use(express.json());
+      app.use(untzrIntegrationRoutes(db, storage, { deploymentMode: "local_trusted" }));
+      app.use(errorHandler);
+      const fetchSource = (overrides = {}) => request(app).post("/source")
+        .set("Authorization", `Bearer ${integrationKey}`)
+        .send({ subject: userId, companyId, projectId: project.id, issueId: issue.id,
+          runId: run.id, revisionId: attributed, startingCommit, ...overrides });
+      try {
+        await fetchSource().expect(403);
+        await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, run.id));
+        await fetchSource({ revisionId: unattributed }).expect(403);
+        await fetchSource({ startingCommit: "b".repeat(40) }).expect(409);
+        await fetchSource({ issueId: randomUUID() }).expect(404);
+        for (const revisionId of [alternateRevision, alternateAttachmentReport, fallbackReport, otherRunReport, wrongDigest]) {
+          await fetchSource({ revisionId }).expect(403);
+        }
+        expect((await issueService(db).getAttachmentById(fallback.body.id))?.originatingRunId).toBeNull();
+        for (const attribution of [{ createdByAgentId: other.id }, { createdByAgentId: approved.id, createdByUserId: userId }]) {
+          await db.update(assets).set(attribution).where(eq(assets.id, attachment.assetId));
+          await fetchSource().expect(403);
+        }
+        await db.update(assets).set({ createdByAgentId: approved.id, createdByUserId: null }).where(eq(assets.id, attachment.assetId));
+        expect(getObject).not.toHaveBeenCalled();
+        const response = await fetchSource().expect(200);
+        expect(response.body).toMatchObject({
+          ...report, runId: run.id, issueId: issue.id, authorizationGeneration: grant.grantId,
+          sourceBase64: bytes.toString("base64"),
+        });
+        getObject.mockImplementationOnce(async (...args) => ({
+          ...await originalGetObject(...args),
+          stream: Readable.from([Buffer.alloc(bytes.length)]),
+        }));
+        await fetchSource().expect(409);
+      } finally {
+        vi.stubEnv("PAPERCLIP_UNTZR_INTEGRATION_KEY_SHA256", previousIntegrationKey);
+      }
+      await db.update(issues).set({ projectWorkspaceId: null }).where(eq(issues.id, issue.id));
+      await expect(checkout(approved.id)).rejects.toThrow("approved Untzr project and repository");
+      await db.update(issues).set({ projectWorkspaceId: workspace.id }).where(eq(issues.id, issue.id));
+      await db.update(agents).set({ adapterConfig: { provider: "codex" } }).where(eq(agents.id, approved.id));
+      await expect(checkout(approved.id)).rejects.toThrow("approved Untzr user, agent");
+      await db.update(agents).set({ adapterConfig: approved.adapterConfig }).where(eq(agents.id, approved.id));
+      await db.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.id, grant.grantId));
+      await expect(checkout(approved.id)).rejects.toThrow("Reconnect");
+      await expect(provider.resolve(providerInput, { ...foreground, runId: otherRun.id })).rejects.toThrow("Reconnect");
+      expect(broker).not.toHaveBeenCalled();
+    } finally {
+      broker.mockRestore();
+      vi.stubEnv("PAPERCLIP_AGENT_JWT_SECRET", previousJwtSecret);
+      vi.stubEnv("PAPERCLIP_UNTZR_SCOPES", previousScopes);
+      vi.stubEnv("PAPERCLIP_GITHUB_APP_PROJECTS", previousProjects);
+    }
+  });
+
   it.each([
     { provider: "openrouter", envKey: "OPENROUTER_API_KEY", routed: false },
     { provider: "openrouter", envKey: "OPENROUTER_API_KEY", routed: true },

@@ -3632,6 +3632,11 @@ async function recordAgentChildTaskRead(db: Db, req: Request, issue: { id: strin
 /** How long a Retry answer waits for admission before it reports the saved request as accepted. */
 const TASK_RETRY_ANSWER_ADMISSION_WAIT_MS = 5_000;
 
+function publicIssue<T extends object>(issue: T) {
+  const { untzrExecution: _privateBinding, ...publicRow } = issue as T & { untzrExecution?: unknown };
+  return publicRow;
+}
+
 export function issueRoutes(
   db: Db,
   storage: StorageService,
@@ -8477,7 +8482,7 @@ export function issueRoutes(
       time("documents", () => documentsSvc.getIssueDocumentPayload(issue)),
       time("work_products", () => workProductsSvc.listForIssue(issue.id)),
     ]);
-    return { ...issue, ...documentPayload, workProducts };
+    return { ...publicIssue(issue), ...documentPayload, workProducts };
   }
 
   /**
@@ -8636,7 +8641,7 @@ export function issueRoutes(
       );
       const compactResult = result.map((issue) =>
         ({ ...toCompactIssue({
-          ...issue,
+          ...publicIssue(issue),
           activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
           interruption: interruptions.get(issue.id) ?? null,
           successfulRunHandoff: handoffStates.get(issue.id) ?? null,
@@ -8673,7 +8678,7 @@ export function issueRoutes(
     return {
       kind: "full",
       body: result.map((issue) => ({
-        ...issue,
+        ...publicIssue(issue),
         successfulRunHandoff: handoffStates.get(issue.id) ?? null,
         activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
         interruption: interruptions.get(issue.id) ?? null,
@@ -9900,7 +9905,7 @@ export function issueRoutes(
     await recordAgentChildTaskRead(db, req, issue);
     res.setHeader("Server-Timing", timing.header());
     res.json({
-      ...issue,
+      ...publicIssue(issue),
       ...inboxArchiveFields,
       goalId: goal?.id ?? issue.goalId,
       ancestors,
@@ -10912,8 +10917,8 @@ export function issueRoutes(
       if (result.replayed) {
         res.json({
           issue: "workspaceRepairOnly" in result
-            ? { ...result.issue, activeRecoveryAction: await recoveryActionsSvc.getActiveForIssue(result.issue.companyId, result.issue.id) }
-            : result.issue,
+            ? { ...publicIssue(result.issue), activeRecoveryAction: await recoveryActionsSvc.getActiveForIssue(result.issue.companyId, result.issue.id) }
+            : publicIssue(result.issue),
           recoveryAction: result.recoveryAction,
         });
         return;
@@ -11022,7 +11027,7 @@ export function issueRoutes(
 
       res.json({
         issue: {
-          ...result.issue,
+          ...publicIssue(result.issue),
           activeRecoveryAction: "workspaceRepairOnly" in result
             ? await recoveryActionsSvc.getActiveForIssue(result.issue.companyId, result.issue.id)
             : null,
@@ -11687,6 +11692,10 @@ export function issueRoutes(
       }
 
       const actor = getActorInfo(req);
+      const signedUntzrSource = Boolean(issue.untzrExecution && keyParsed.data === "untzr-source");
+      if (signedUntzrSource && (actor.actorSource !== "agent_jwt" || !actor.runId)) {
+        throw forbidden("Untzr source reports require the authenticated active task run");
+      }
       const sourceTrust = await sourceTrustForActorWrite(issue, actor);
       const referenceSummaryBefore =
         await issueReferencesSvc.listIssueReferenceSummary(issue.id);
@@ -11702,6 +11711,7 @@ export function issueRoutes(
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
         createdByRunId: actor.runId ?? null,
         sourceTrust,
+        signedUntzrSource,
         lockedDocumentStrategy:
           req.actor.type === "agent" ? "create_new_document" : "conflict",
       });
@@ -13475,6 +13485,7 @@ export function issueRoutes(
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
         actorRunId: actor.runId,
+        authenticatedCreatingRunId: actor.actorSource === "agent_jwt" ? actor.runId : null,
         actorResponsibleUserId: authenticatedActorResponsibleUserId(req),
         trustExplicitResponsibleUserId: actor.actorType === "user",
         watchdogActorRunId: actor.runId,
@@ -13515,7 +13526,7 @@ export function issueRoutes(
       const referenceSummary = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
       const visibleReferenceSummary = await redactIssueReferenceEdges(req, companyId, referenceSummary);
         res.status(200).json({
-          ...issue,
+          ...publicIssue(issue),
           deduplicated: true,
           deduplicationReason,
         relatedWork: visibleReferenceSummary,
@@ -13713,7 +13724,7 @@ export function issueRoutes(
 
     const visibleReferenceSummary = await redactIssueReferenceEdges(req, companyId, referenceSummary);
       res.status(201).json({
-        ...issue,
+        ...publicIssue(issue),
       relatedWork: visibleReferenceSummary,
       referencedIssueIdentifiers: visibleReferenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
       });
@@ -13886,6 +13897,7 @@ export function issueRoutes(
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
         actorRunId: actor.runId,
+        authenticatedCreatingRunId: actor.actorSource === "agent_jwt" ? actor.runId : null,
         actorResponsibleUserId: authenticatedActorResponsibleUserId(req),
         trustExplicitResponsibleUserId: actor.actorType === "user",
         actorAgentId: actor.agentId,
@@ -13993,7 +14005,7 @@ export function issueRoutes(
       });
       await queueTaskWatchdogEvaluation(issue, actor.runId);
 
-      res.status(201).json(issue);
+      res.status(201).json(publicIssue(issue));
     },
   );
 
@@ -14106,6 +14118,7 @@ export function issueRoutes(
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
           actorRunId: actor.runId,
+          authenticatedCreatingRunId: actor.actorSource === "agent_jwt" ? actor.runId : null,
           actorResponsibleUserId: authenticatedActorResponsibleUserId(req),
           trustExplicitResponsibleUserId: actor.actorType === "user",
           actorAgentId: actor.agentId,
@@ -14649,7 +14662,7 @@ export function issueRoutes(
       }
 
       res.json({
-        issue: result.issue,
+        issue: publicIssue(result.issue),
         action: req.body.action,
         comment: result.comment,
         wakeQueued,
@@ -14750,7 +14763,6 @@ export function issueRoutes(
     );
   }
 
-  const githubHandoffPath = "/issues/:id/github-handoff";
   const githubHandoffOperation = z.object({
     operationId: z.string().uuid(),
     action: z.enum(["approve", "merge"]),
@@ -14772,19 +14784,19 @@ export function issueRoutes(
     return issue;
   }
 
-  router.get(githubHandoffPath, async (req, res) => {
+  router.get("/issues/:id/github-handoff", async (req, res) => {
     const issue = await githubHandoffIssue(req, res);
     if (issue) res.json(await readIssueGithubHandoff(db, issue.id));
   });
 
-  router.post(githubHandoffPath, validate(githubHandoffOperation), async (req, res) => {
+  router.post("/issues/:id/github-handoff", validate(githubHandoffOperation), async (req, res) => {
     const issue = await githubHandoffIssue(req, res);
     if (!issue) return;
     const { begin, operationId, action, sha, ...expected } = githubHandoffOperation.parse(req.body);
     res.json(await reserveIssueGithubHandoff(db, issue.id, { operationId, action, sha }, expected, begin));
   });
 
-  router.delete(`${githubHandoffPath}/:operationId`, async (req, res) => {
+  router.delete("/issues/:id/github-handoff/:operationId", async (req, res) => {
     const issue = await githubHandoffIssue(req, res);
     if (!issue) return;
     const operationId = z.string().uuid().safeParse(req.params.operationId);
@@ -17331,7 +17343,7 @@ export function issueRoutes(
         });
         return;
       }
-      res.json({ ...issueResponse, changes, comment, ...(parentAdjusted ? { parentAdjusted } : {}) });
+      res.json({ ...publicIssue(issueResponse), changes, comment, ...(parentAdjusted ? { parentAdjusted } : {}) });
     },
   );
 
@@ -17395,7 +17407,7 @@ export function issueRoutes(
     });
 
     await queueTaskWatchdogEvaluation(existing, actor.runId);
-    res.json(issue);
+    res.json(publicIssue(issue));
   });
 
   router.post(
@@ -17549,7 +17561,7 @@ export function issueRoutes(
           );
       }
 
-      res.json(updated);
+      res.json(updated == null ? updated : publicIssue(updated));
     },
   );
 
@@ -17590,7 +17602,7 @@ export function issueRoutes(
       details: { status: released.status, _previous: { status: existing.status } },
     });
 
-    res.json(released);
+    res.json(publicIssue(released));
   });
 
   router.post("/issues/:id/admin/force-release", async (req, res) => {
@@ -17635,7 +17647,7 @@ export function issueRoutes(
       },
     });
 
-    res.json(result);
+    res.json({ ...result, issue: publicIssue(result.issue) });
   });
 
   /** `GET /issues/:id/recent-comments`, shared with the chat bootstrap. */
@@ -19472,7 +19484,7 @@ export function issueRoutes(
       },
     });
 
-    res.json(deleted);
+    res.json(publicIssue(deleted));
   });
 
   router.get("/issues/:id/feedback-votes", async (req, res) => {
@@ -19584,7 +19596,9 @@ export function issueRoutes(
     assertCompanyAccess(req, companyId);
     if (req.actor.type !== "board" || !req.actor.userId) throw forbidden("Board user access required");
     const conversations = await svc.listConversations(companyId, req.actor.userId);
-    res.json(await withConversationReadState(db, companyId, req.actor.userId, await filterIssuesForActor(req, conversations)));
+    const visible = await filterIssuesForActor(req, conversations);
+    const rows = await withConversationReadState(db, companyId, req.actor.userId, visible);
+    res.json(rows.map(publicIssue));
   });
 
   // GET stays read-only. POST resolves the single chat on explicit add or first send/upload.
@@ -19600,7 +19614,7 @@ export function issueRoutes(
       const existing = await svc.getConversation(companyId, agent.id, req.actor.userId);
       if (existing && !(await assertIssueReadAllowed(req, res, existing))) return;
       if (existing || method === "get") {
-        res.json(existing ? (await withConversationReadState(db, companyId, req.actor.userId, [existing]))[0] : null);
+        res.json(existing ? (await withConversationReadState(db, companyId, req.actor.userId, [existing])).map(publicIssue)[0] : null);
         return;
       }
       const issue = await svc.create(companyId, {
@@ -19611,7 +19625,7 @@ export function issueRoutes(
       await logActivity(db, { companyId, actorType: "user", actorId: req.actor.userId,
         action: "issue.conversation_opened", entityType: "issue", entityId: issue.id,
         details: { agentId: agent.id } });
-      res.json((await withConversationReadState(db, companyId, req.actor.userId, [issue]))[0]);
+      res.json((await withConversationReadState(db, companyId, req.actor.userId, [issue])).map(publicIssue)[0]);
     });
   }
 
@@ -20921,7 +20935,10 @@ export function issueRoutes(
           originalFilename: stored.originalFilename,
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-          createdByRunId: actor.runId,
+          // Untzr source receipts rely on run provenance. An agent key's run
+          // header is caller-supplied, while the JWT binds it to the signer.
+          createdByRunId: issue.untzrExecution && actor.actorSource !== "agent_jwt" ? null : actor.runId,
+          signedUntzrSource: Boolean(issue.untzrExecution && actor.actorSource === "agent_jwt"),
         });
       } catch (err) {
         // A known 4xx means the registration transaction definitely rejected

@@ -8,7 +8,7 @@ import { HttpError, unprocessable } from "../errors.js";
 import { mkdtemp, mkdir, writeFile, readFile, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { type Db, companySecrets, connectionGrants } from "@paperclipai/db";
 import {
   AI_CONNECTION_CAPABILITIES,
@@ -220,6 +220,7 @@ export async function prepareManagedAiRuntime(
     adapterType: string;
     binding: AiConnectionBinding;
     allowUninstalledPersonal?: boolean;
+    pinnedPersonalGrant?: { connectionId: string; grantId: string; authorizationGeneration?: string };
     allowUninstalledShared?: boolean;
     allowLegacyValidation?: boolean;
     config: Record<string, unknown>;
@@ -281,10 +282,16 @@ export async function prepareManagedAiRuntime(
     if (!noAuth && !credentialRef) throw unprocessable("The selected AI credential is unavailable");
     const readFreshness = async () => {
       if (!credentialRef) return undefined;
-      const [currentGrant] = await db.select({ refs: connectionGrants.credentialSecretRefs, status: connectionGrants.status })
+      const [currentGrant] = await db.select({
+        refs: connectionGrants.credentialSecretRefs, status: connectionGrants.status,
+        authorizationGeneration: sql<string | null>`${connectionGrants.providerTenant}->>'authorizationGeneration'`,
+      })
         .from(connectionGrants).where(and(eq(connectionGrants.companyId, input.companyId), eq(connectionGrants.id, selection.grant.id)));
       const currentRef = currentGrant?.refs.find(ref => ref.configPath === "ai.credential");
-      if (currentGrant?.status !== "active" || currentRef?.secretId !== credentialRef.secretId || currentRef.versionSelector !== credentialRef.versionSelector) return undefined;
+      if (currentGrant?.status !== "active" || currentRef?.secretId !== credentialRef.secretId ||
+          currentRef.versionSelector !== credentialRef.versionSelector ||
+          (input.pinnedPersonalGrant &&
+            (currentGrant.authorizationGeneration ?? undefined) !== input.pinnedPersonalGrant.authorizationGeneration)) return undefined;
       // The share lock waits behind a rotating writer, so the read after
       // resolution sees a concurrent rotation instead of the pre-rotation
       // version. A lock takes no new row version and aborts no admission.
@@ -298,12 +305,13 @@ export async function prepareManagedAiRuntime(
       // against a concurrent reconnect or explicit rotation.
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const before = await readFreshness();
+        if (!before) break;
         const value = await service.runtimeCredential(selection);
         const after = await readFreshness();
-        if (before && after && before.version === after.version && before.epoch === after.epoch) {
+        if (after && before.version === after.version && before.epoch === after.epoch) {
           return { value, freshness: after };
         }
-        if (!before || before.epoch !== after?.epoch) break;
+        if (before.epoch !== after?.epoch) break;
       }
       throw unprocessable("The AI credential changed during preparation; retry this execution");
     })();

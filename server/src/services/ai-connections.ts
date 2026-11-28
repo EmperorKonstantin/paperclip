@@ -275,11 +275,14 @@ export function aiConnectionService(db: Db) {
     runnerProvider?: unknown;
     acpxAgent?: unknown;
     allowUninstalledPersonal?: boolean;
+    pinnedPersonalGrant?: { connectionId: string; grantId: string; authorizationGeneration?: string };
     allowUninstalledShared?: boolean;
     allowLegacyValidation?: boolean;
     binding: AiConnectionBinding;
   }) {
-    const { companyId, userId, agentId, binding } = input;
+    const { companyId, userId, agentId, binding, pinnedPersonalGrant } = input;
+    if (pinnedPersonalGrant && (binding.mode !== "responsible_user" || !userId))
+      throw forbidden("A pinned personal connection requires its responsible user");
     // The grant-kind checks below cover only these three modes. Callers parse
     // the binding first, but an unknown mode must never skip those checks.
     if (binding.mode !== "responsible_user" && binding.mode !== "shared" && binding.mode !== "delegated")
@@ -299,7 +302,7 @@ export function aiConnectionService(db: Db) {
     if (userId && !(await membership(companyId, userId)))
       throw forbidden("The responsible user is not an active company member");
     const defaultRow =
-      binding.mode === "responsible_user"
+      binding.mode === "responsible_user" && !pinnedPersonalGrant
         ? (
             await db
               .select()
@@ -316,24 +319,28 @@ export function aiConnectionService(db: Db) {
         : null;
     const grantId =
       binding.mode === "responsible_user"
-        ? defaultRow?.grantId
+        ? pinnedPersonalGrant?.grantId ?? defaultRow?.grantId
         : binding.grantId;
     if (!grantId)
       throw aiConnectionConfigurationFailure("ai_connection_default_missing", "Connect an account and choose your personal default");
     const row = (await rows(companyId)).find(
       (r) =>
         r.grant.id === grantId &&
-        (binding.mode === "responsible_user" ||
-          r.connection.id === binding.connectionId),
+        (binding.mode === "responsible_user"
+          ? !pinnedPersonalGrant || r.connection.id === pinnedPersonalGrant.connectionId
+          : r.connection.id === binding.connectionId),
     );
     if (!row)
       throw aiConnectionConfigurationFailure("ai_connection_missing", "The selected AI connection is unavailable");
     const { connection, grant } = row;
+    if (pinnedPersonalGrant && pinnedPersonalGrant.authorizationGeneration !== grant.providerTenant?.authorizationGeneration)
+      throw forbidden("The pinned AI authorization has been revoked. Start a new handoff.");
     const metadata = aiConnectionMetadataSchema.safeParse(connection.config.ai);
     if (
       !metadata.success ||
       metadata.data.provider !== binding.provider ||
-      (binding.mode !== "responsible_user" && metadata.data.method !== binding.method) ||
+      ((pinnedPersonalGrant || binding.mode !== "responsible_user") && metadata.data.method !== binding.method) ||
+      (pinnedPersonalGrant && metadata.data.routing !== undefined) ||
       !isAiConnectionCompatible(metadata.data, input.adapterType, input.model, input.runnerProvider, input.acpxAgent)
     )
       throw aiConnectionConfigurationFailure("ai_connection_incompatible", "The selected AI connection is incompatible");
@@ -636,6 +643,7 @@ export function aiConnectionService(db: Db) {
     attemptStartedAt = new Date(),
     managementContext?: ConnectionManagementContext,
     verifiedAccountLabel?: string,
+    untzrApiKeyProvisioning?: { id: string; projectId: string; fingerprint: string },
   ) {
     await managementContext?.reauthorize();
     const routing = "routing" in input ? input.routing : undefined;
@@ -672,7 +680,11 @@ export function aiConnectionService(db: Db) {
       throw unprocessable(
         "Reconnect cannot change the sign-in method or ownership",
       );
-    const id = reconnect?.connection.id ?? randomUUID();
+    if (reconnect?.connection.config.untzrApiKeyProvisioning)
+      throw unprocessable("An Untzr API key must be revoked before replacing it");
+    if (untzrApiKeyProvisioning && (input.connectionId || input.ownership !== "personal" || input.method !== "api_key" || routing))
+      throw unprocessable("Untzr provisioning requires a new personal API key");
+    const id = reconnect?.connection.id ?? untzrApiKeyProvisioning?.id ?? randomUUID();
     const grantId = reconnect?.grant.id ?? randomUUID();
     const persist = () => withAccountHomeSecretMutationLock(undefined, companyId, () => db.transaction(async (tx) => {
       await managementContext?.reauthorize();
@@ -716,6 +728,7 @@ export function aiConnectionService(db: Db) {
         )
           throw forbidden("Login target mismatch");
       }
+      let authorizationGeneration: string | undefined;
       if (reconnect) {
         const [current] = await tx
           .select()
@@ -724,10 +737,15 @@ export function aiConnectionService(db: Db) {
           .for("update");
         if (
           !current ||
+          current.status !== reconnect.grant.status ||
+          current.providerTenant?.authorizationGeneration !== reconnect.grant.providerTenant?.authorizationGeneration ||
           current.updatedAt.getTime() !== reconnect.grant.updatedAt.getTime() ||
           current.updatedAt.getTime() > attemptStartedAt.getTime()
         )
           throw unprocessable("The connection changed. Start reconnect again.");
+        authorizationGeneration = current.kind === "user" && (current.status === "revoked" || current.revokedAt)
+          ? randomUUID()
+          : current.providerTenant?.authorizationGeneration;
       }
       let secretId = reconnect?.grant.credentialSecretRefs.find(
         (r) => r.configPath === "ai.credential",
@@ -864,6 +882,11 @@ export function aiConnectionService(db: Db) {
               sourceTemplateKey: source,
               ai: { provider: input.provider, method: input.method, ...(routing ? { routing } : {}) },
               aiIsolatedSubscription: input.method === "subscription" && input.provider !== "anthropic",
+              ...(untzrApiKeyProvisioning ? {
+                untzrApiKeyProvisioning: {
+                  projectId: untzrApiKeyProvisioning.projectId, fingerprint: untzrApiKeyProvisioning.fingerprint,
+                },
+              } : {}),
             },
             createdByUserId: userId,
           });
@@ -897,18 +920,21 @@ export function aiConnectionService(db: Db) {
           versionSelector: "latest" as const,
         },
       ] : [];
-      if (reconnect)
+      if (reconnect) {
         await tx
           .update(connectionGrants)
           .set({
             status: "active",
-            providerTenant: accountLabel ? { name: accountLabel } : {},
+            providerTenant: {
+              ...(accountLabel ? { name: accountLabel } : {}),
+              ...(authorizationGeneration ? { authorizationGeneration } : {}),
+            },
             credentialSecretRefs: refs,
             revokedAt: null,
             updatedAt: new Date(),
           })
           .where(eq(connectionGrants.id, grantId));
-      else
+      } else
         await tx
           .insert(connectionGrants)
           .values({

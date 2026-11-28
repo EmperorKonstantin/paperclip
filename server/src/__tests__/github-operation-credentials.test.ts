@@ -110,6 +110,20 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       } finally { capture.flush(); await observed.$client.end(); }
     });
 
+    it("denies Untzr write credential resolution for a run with an active GitHub grant", async () => {
+      const input = await seed();
+      await grant(input, "A");
+      expect(await resolveGitHubOperationCredentials(db, input)).toMatchObject({ status: "available" });
+      await db.update(issues).set({ untzrExecution: { subject: "fixture-untzr-user" } })
+        .where(eq(issues.id, input.issueId));
+      vault.resolveUserSecretValue.mockClear();
+      vault.resolveSecretValue.mockClear();
+
+      await expect(resolveGitHubOperationCredentials(db, input)).rejects.toThrow("Untzr publisher");
+      expect(vault.resolveUserSecretValue).not.toHaveBeenCalled();
+      expect(vault.resolveSecretValue).not.toHaveBeenCalled();
+    });
+
     it("resolves current GitHub credentials without transferring execution snapshots", async () => {
       const input = await seed(), selected = await grant(input, "A");
       const payload = "github-credential-saved-input🙂".repeat(25_000);

@@ -115,7 +115,7 @@ describe("Google local sign-in service admission", () => {
 
   it("requires a fresh browser exchange after server process state is lost", async () => {
     const db = database(), service = localAiLoginService(db);
-    const session = { id: "unknown-browser-process", aiConnection: intent, status: "waiting_for_user", connectionMethod: "local_subscription", expiresAt: new Date(Date.now() + 60_000) };
+    const session = { id: "unknown-browser-process", integrationScope: null, aiConnection: intent, status: "waiting_for_user", connectionMethod: "local_subscription", expiresAt: new Date(Date.now() + 60_000) };
     mocks.root.mockReturnValue(await realpath(tmpdir()));
     db.selections.push([session]);
     expect(await service.check("company", "user", intent, session.id)).toMatchObject({ status: "sign_in_required", error: "The server restarted during sign-in. Start sign-in again." });
@@ -343,6 +343,7 @@ describe("Google local sign-in service admission", () => {
       startedByUserId: "user",
       connectionMethod: "local_subscription",
       adapterType: "claude_local",
+      integrationScope: null,
       aiConnection: { ...intent, provider: "anthropic" as const },
       status: "waiting_for_user",
       expiresAt: new Date(Date.now() + 60_000),

@@ -1,3 +1,4 @@
+import { materializeFreshWorkspaceSeed } from "../services/fresh-workspace-seed.js";
 import { execFile, spawn } from "node:child_process";
 import { setupCommandFailureResultJson } from "../services/workspace-setup-command-failure.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -9,7 +10,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -640,6 +641,35 @@ describe("resolveRuntimeProvisionCommand", () => {
   });
 });
 
+describe("scoped fresh workspace seed", () => {
+  it("copies the approved commit reachable only from the cache's tracking ref", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-scoped-fresh-home-"));
+    const previousHome = process.env.PAPERCLIP_HOME;
+    vi.stubEnv("PAPERCLIP_HOME", home);
+    try {
+      const branch = "untzr/0123456789abcdef";
+      const baseRef = `refs/remotes/origin/${branch}`;
+      const commit = await advanceRemoteMaster(sourceRepo, remotePath, "only-on-approved-branch.txt");
+      await runGit(sourceRepo, ["push", remotePath, `HEAD:refs/heads/${branch}`]);
+      await runGit(repoRoot, ["fetch", "--no-tags", "--no-recurse-submodules", remotePath, `+refs/heads/${branch}:${baseRef}`]);
+      expect(await readGit(repoRoot, ["for-each-ref", "--contains", commit, "--format=%(refname)"])).toBe(baseRef);
+
+      const cwd = await materializeFreshWorkspaceSeed({
+        companyId: randomUUID(), issueId: randomUUID(), runId: randomUUID(), sourceCwd: repoRoot,
+        baseRef, expectedCommit: commit, repoUrl: remotePath,
+      });
+      expect(await readGit(cwd, ["rev-parse", "HEAD"])).toBe(commit);
+      expect(await readGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe("HEAD");
+      expect(await readGit(cwd, ["remote", "get-url", "origin"])).toBe(remotePath);
+      await expect(fs.stat(path.join(cwd, ".git", "objects", "info", "alternates"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      vi.stubEnv("PAPERCLIP_HOME", previousHome);
+      await fs.rm(home, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("refreshRemoteTrackingBaseRef git auth", () => {
   it("does not diagnose a missing remote branch as a rejected credential", async () => {
     const { repoRoot } = await createClonedRepoWithRemote();
@@ -665,6 +695,95 @@ describe("refreshRemoteTrackingBaseRef git auth", () => {
     });
     expect(warnings).toEqual([]);
     expect(offeredUrls).toEqual([remotePath]);
+  });
+
+  it.each(["denied", "unavailable"] as const)(
+    "withholds ambient fetches during scoped worktree creation and restore when checkout is %s",
+    async (availability) => {
+      const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+      await runGit(repoRoot, ["config", "user.name", "Synthetic host identity"]);
+      const before = await readGit(repoRoot, ["rev-parse", "origin/master"]);
+      const after = await advanceRemoteMaster(sourceRepo, remotePath, "scoped-first.txt");
+      const denied = Object.assign(async () => {
+        if (availability === "denied") throw new Error("Scoped checkout denied");
+        return null;
+      }, { requireScopedCheckout: true });
+      const approved = Object.assign(async () => ({
+        configArgs: [], env: { GIT_TERMINAL_PROMPT: "0" }, source: "managed_connection",
+      }), { requireScopedCheckout: true });
+      await expect(realizeWorktreeForTest(repoRoot, "origin/master", denied)).rejects.toThrow(/scoped.*checkout/i);
+      expect(await readGit(repoRoot, ["rev-parse", "origin/master"])).toBe(before);
+
+      const fresh = await realizeWorktreeForTest(repoRoot, "origin/master", approved);
+      expect(await readGit(repoRoot, ["rev-parse", "origin/master"])).toBe(after);
+      await advanceRemoteMaster(sourceRepo, remotePath, "scoped-second.txt");
+      await expect(ensurePersistedExecutionWorkspaceAvailable({
+        resolveGitAuth: denied,
+        base: fresh,
+        workspace: {
+          id: "workspace-1", mode: "isolated_workspace", strategyType: "git_worktree",
+          cwd: fresh.cwd, providerRef: fresh.cwd, projectId: "project-1", projectWorkspaceId: "workspace-1",
+          repoUrl: null, baseRef: "origin/master", branchName: fresh.branchName,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        },
+        issue: { id: "issue-1", identifier: "PAP-447", title: "Add Worktree Support" },
+        agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+      })).rejects.toThrow(/scoped.*checkout/i);
+      expect(await readGit(repoRoot, ["rev-parse", "origin/master"])).toBe(after);
+    },
+  );
+
+  it("refreshes only the authorized remote when Git is configured to fetch submodules", async () => {
+    const submodule = await createClonedRepoWithRemote();
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    await runGit(sourceRepo, ["-c", "protocol.file.allow=always", "submodule", "add", submodule.remotePath, "dependency"]);
+    await runGit(sourceRepo, ["commit", "-m", "Add submodule"]);
+    await runGit(sourceRepo, ["push", remotePath, "HEAD:master"]);
+    await runGit(repoRoot, ["pull", "--ff-only"]);
+    await runGit(repoRoot, ["-c", "protocol.file.allow=always", "submodule", "update", "--init"]);
+    await runGit(path.join(repoRoot, "dependency"), ["remote", "set-url", "origin", path.join(repoRoot, "missing.git")]);
+    await runGit(repoRoot, ["config", "fetch.recurseSubmodules", "true"]);
+    const expected = await advanceRemoteMaster(sourceRepo, remotePath, "scoped-update.txt");
+
+    const approved = Object.assign(async () => ({
+      configArgs: [], env: { GIT_TERMINAL_PROMPT: "0" }, source: "managed_connection",
+    }), { requireScopedCheckout: true });
+    await expect(refreshRemoteTrackingBaseRef(repoRoot, "origin/master", approved)).resolves.toEqual([]);
+    expect(await readGit(repoRoot, ["rev-parse", "origin/master"])).toBe(expected);
+  });
+
+  it("stops before creating a scoped worktree when the approved task branch moved", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const branch = "untzr/0123456789abcdef";
+    const baseRef = `refs/remotes/origin/${branch}`;
+    const startingCommit = await readGit(repoRoot, ["rev-parse", "origin/master"]);
+    await runGit(sourceRepo, ["push", remotePath, `HEAD:refs/heads/${branch}`]);
+    const approved = Object.assign(async () => ({
+      configArgs: [], env: { GIT_TERMINAL_PROMPT: "0" }, source: "managed_connection",
+    }), { requireScopedCheckout: true, expectedCheckout: { baseRef, sha: startingCommit } });
+
+    const workspace = await realizeWorktreeForTest(repoRoot, baseRef, approved);
+    expect(workspace.baseRefSha).toBe(startingCommit);
+    const moved = await advanceRemoteMaster(sourceRepo, remotePath, "branch-moved.txt");
+    await runGit(sourceRepo, ["push", remotePath, `HEAD:refs/heads/${branch}`]);
+    await expect(realizeWorktreeForTest(repoRoot, baseRef, approved)).rejects.toThrow("approved Untzr starting commit");
+    expect(await readGit(repoRoot, ["rev-parse", baseRef])).toBe(moved);
+    expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(startingCommit);
+    const retained = workspace.cwd + ".retained";
+    await fs.rename(workspace.cwd, retained);
+    await expect(ensurePersistedExecutionWorkspaceAvailable({
+      resolveGitAuth: approved,
+      base: workspace,
+      workspace: {
+        id: "workspace-1", mode: "isolated_workspace", strategyType: "git_worktree",
+        cwd: workspace.cwd, providerRef: workspace.cwd, projectId: "project-1", projectWorkspaceId: "workspace-1",
+        repoUrl: null, baseRef, branchName: workspace.branchName, metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+      },
+      issue: { id: "issue-1", identifier: "PAP-447", title: "Restore" },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+    })).rejects.toThrow("approved Untzr starting commit");
+    await expect(fs.stat(workspace.cwd)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readGit(retained, ["rev-parse", "HEAD"])).toBe(startingCommit);
   });
 
   it("attributes a failed authenticated fetch to the credential that was used", async () => {

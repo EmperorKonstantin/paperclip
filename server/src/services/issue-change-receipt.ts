@@ -24,6 +24,7 @@ export function buildIssueChanges(
   const changes: IssueChanges = {};
   const keys = new Set([...Object.keys(existing), ...Object.keys(updated)]);
   keys.delete("updatedAt");
+  keys.delete("untzrExecution");
 
   for (const key of keys) {
     const from = existing[key];

@@ -1,3 +1,4 @@
+import { readUntzrIssueExecution } from "../untzr-execution.js";
 import { isUniqueViolation } from "../../db-errors.js";
 import { skillPackageStore, skillVersionMetadataColumns } from "../skill-package-store.js";
 import { skillAccessService } from "../skill-access.js";
@@ -3214,6 +3215,10 @@ export function createHeartbeatRunPreparation(db: Db) {
     triggerDetail?: WakeupOptions["triggerDetail"] | null;
     existingRunResponsibleUserId?: string | null;
   }) {
+    const untzr = input.issueContext && process.env.PAPERCLIP_UNTZR_SCOPES
+      ? await readUntzrIssueExecution(db, input.companyId, input.issueContext.id)
+      : null;
+    if (untzr) return untzr.execution.userId;
     const contextResponsibleUserId = readNonEmptyString(
       input.contextSnapshot.responsibleUserId,
     );

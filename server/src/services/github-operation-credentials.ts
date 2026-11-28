@@ -24,6 +24,8 @@ import { assertTaskWorkspaceExecutionAccess } from "./task-workspace-access.js";
 import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
 import { isLowTrustQuarantined } from "./source-trust.js";
 
+import { assertUntzrGitHubWriteAllowed } from "./untzr-execution.js";
+
 export type GitHubCredentialSummary = {
   status: "available" | "absent" | "unavailable";
   source?: "personal" | "dedicated";
@@ -134,6 +136,7 @@ export async function resolveGitHubOperationCredentials(
     runId: string;
   },
 ) {
+  await assertUntzrGitHubWriteAllowed(db, input.companyId, input);
   const { run, context } = await captureRunIdentity(db, input, { readScope: "github_credentials" });
   if (!context) throw forbidden("This run predates managed GitHub credentials");
   return resolveCapturedGitHubCredentials(db, run, context);
@@ -143,6 +146,7 @@ export async function resolveGitHubCompletionCredentials(
   db: Db,
   input: { companyId: string; issueId: string; runId: string },
 ) {
+  await assertUntzrGitHubWriteAllowed(db, input.companyId, input);
   const [source] = await db.select({ agentId: heartbeatRuns.agentId })
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
     eq(heartbeatRuns.nativeIssueId, input.issueId))).limit(1);
@@ -177,9 +181,7 @@ async function resolveCapturedGitHubCredentials(db: Db, run: GitHubCredentialRun
     };
   }
   try {
-    const appToken = process.env.PAPERCLIP_GITHUB_APP_PROJECTS
-      ? await resolveGitHubAppRunToken(db, run, context)
-      : undefined;
+    const appToken = await resolveGitHubAppRunToken(db, run, context);
     if (appToken) {
       summary = { status: "available", source: "dedicated", authenticationMode: "managed" };
       await saveGitHubSummary(db, context, summary);
@@ -250,7 +252,8 @@ async function resolveGitHubAppRunToken(db: Db, run: GitHubCredentialRun, contex
   const issueId = run.issueId ?? run.nativeIssueId ?? run.contextSnapshot?.issueId ?? run.contextSnapshot?.taskId;
   if (typeof issueId !== "string" || !isUuidLike(issueId)) return undefined;
   const [issue] = await db.select({ projectId: issues.projectId, assigneeAgentId: issues.assigneeAgentId,
-    executionWorkspaceId: issues.executionWorkspaceId }).from(issues)
+    executionWorkspaceId: issues.executionWorkspaceId,
+    projectWorkspaceId: issues.projectWorkspaceId }).from(issues)
     .where(and(eq(issues.companyId, input.companyId), eq(issues.id, issueId)));
   if (!issue?.projectId) return undefined;
   const binding = githubAppProjectBinding(input.companyId, issue.projectId);
