@@ -22,13 +22,17 @@ subject from the authenticated Untzr session on the backend.
 - `status` returns opaque connection and grant references, provider, method,
   connection status, and Codex sign-in availability.
 - `api-key` accepts `provider` (`openai` or `anthropic`) and a write-only
-  `apiKey`. Pass `connectionId` to replace an existing key for the same
-  provider. Paperclip verifies the key with the provider and stores it in its
-  encrypted secret store.
+  `apiKey`. For a new managed binding, persist a unique `provisioningId` UUID
+  before sending the request. Retry with the same ID and payload. Paperclip
+  verifies the key with the provider, stores it encrypted, and returns only
+  `connectionId`, `grantId`, and `authorizationGeneration`. A request with
+  `provisioningId` creates a new binding. Existing callers can use
+  `connectionId` for legacy replacements.
 - `disconnect` accepts `provider` and `connectionId` and revokes the personal
-  grant. Queued runs and retries recheck the grant before execution. Reconnecting
-  after revocation requires a new handoff with a new request ID. Replacing
-  credentials on an active grant preserves authorization for existing handoffs.
+  grant. Repeating the same disconnect succeeds. To rotate a managed key,
+  revoke its saved connection and provision with a new UUID. Queued runs and
+  retries recheck the grant before execution. A new handoff needs a new request
+  ID after revocation.
 - `codex/start` accepts an optional `connectionId` for replacement. It
   returns an expiring attempt reference. Send that reference as `attempt`
   with the same context and replacement ID to `codex/status`,
@@ -47,11 +51,18 @@ native flow.
 
 Send `provider`, `connectionId`, `grantId`, `agentId`, `requestId`, `title`,
 and an optional `description` to `launch`. Reuse the same request ID and
-payload after an ambiguous response. The response contains a task reference.
-Use a new ID for a new request. Configure isolated Paperclip Runner agents
-with the matching Codex or Claude harness for every approved stage. A task
-and its follow-ups retain the original user, grant, project, workspace,
-repository, and source ref.
+payload after an ambiguous response. The response contains the issue ID,
+identifier, and opaque authorization generation. Use a new ID for a new
+request. Configure isolated Paperclip Runner agents with the matching Codex
+or Claude harness for every approved stage.
+
+Publisher launches take `taskBranch` and `startingCommit` from Untzr's
+approved task branch. A later stage sends its `predecessorIssueId` with the
+same branch, personal grant, and the publisher-verified current commit.
+A follow-up cycle sends `followUp` as the string `"true"`, a distinct approved
+branch, and the exact independently released commit. It starts with the
+original implementer and retains the original user, grant, project,
+workspace, and repository.
 
 ## Source publication
 

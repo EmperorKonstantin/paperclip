@@ -9,6 +9,7 @@ import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.j
 import { projectGitAuthorizationService } from "../services/project-git-authorization.js";
 import { issueService } from "../services/issues.js";
 import { documentService } from "../services/documents.js";
+import * as aiApiKeyTest from "../services/ai-api-key-test.js";
 import { createGitRemoteAuthProvider } from "../services/git-credentials.js";
 import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
 import { githubAppTaskCheckout } from "../services/github-app-credentials.js";
@@ -193,6 +194,7 @@ describe("managed AI connections", () => {
     const mockedHeartbeat = vi.spyOn(heartbeatModule, "heartbeatService").mockImplementation((...args) => ({
       ...realHeartbeatService(...args), wakeup,
     }));
+    const validateKey = vi.spyOn(aiApiKeyTest, "validateAiApiKey").mockResolvedValue(undefined);
     try {
       const storage = createStorageService(createLocalDiskStorageProvider(path.join(home, "launch-test-storage")));
       const app = express();
@@ -227,7 +229,53 @@ describe("managed AI connections", () => {
         ...grants[0], publication: { taskBranch, predecessorIssueId: rootId, startingCommit: review.startingCommit },
       });
       expect(wakeup).toHaveBeenCalledWith(stages[1].id, expect.objectContaining({ requestedByActorId: users[0] }));
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, accepted.body.issueId));
+      const followUp = {
+        predecessorIssueId: accepted.body.issueId, taskBranch: "untzr/23456789abcdef01",
+        startingCommit: review.startingCommit, requestId: randomUUID(), followUp: "true",
+      };
+      await launch(0, { ...followUp, followUp: undefined }).expect(403);
+      await launch(0, { ...followUp, taskBranch }).expect(403);
+      await launch(0, { ...followUp, startingCommit: startingCommit }).expect(403);
+      await launch(0, { ...followUp, agentId: stages[1].id }).expect(403);
+      await launch(1, followUp).expect(403);
+      const next = await launch(0, followUp).expect(202);
+      expect(next.body.authorizationGeneration).toBe(grants[0].grantId);
+      await launch(0, followUp).expect(202).expect(next.body);
+      const [nextIssue] = await db.select().from(issues).where(eq(issues.id, next.body.issueId));
+      expect(nextIssue.untzrExecution).toMatchObject({
+        ...grants[0], publication: {
+          taskBranch: followUp.taskBranch, startingCommit: review.startingCommit,
+          predecessorIssueId: accepted.body.issueId, implementerAgentId: stages[0].id,
+        },
+      });
+
+      const provisioningId = randomUUID();
+      const keyRequest = (endpoint: string, user: number, body: object) => request(app).post(endpoint)
+        .set("Authorization", `Bearer ${integrationKey}`)
+        .send({ subject: users[user], companyId, projectId: project.id, provider: "anthropic", ...body });
+      const keyBody = { apiKey: "fixture-personal-key", provisioningId };
+      const [provisioned, duplicate] = await Promise.all([
+        keyRequest("/api-key", 0, keyBody).expect(201), keyRequest("/api-key", 0, keyBody).expect(201),
+      ]);
+      expect(provisioned.body).toEqual(duplicate.body);
+      expect(provisioned.body).toEqual({
+        connectionId: provisioningId, grantId: expect.any(String), authorizationGeneration: provisioned.body.grantId,
+      });
+      validateKey.mockClear();
+      await keyRequest("/api-key", 0, keyBody).expect(201).expect(provisioned.body);
+      await keyRequest("/api-key", 0, { ...keyBody, apiKey: "fixture-changed-key" }).expect(409);
+      await keyRequest("/api-key", 1, keyBody).expect(409);
+      expect(validateKey).not.toHaveBeenCalled();
+      await keyRequest("/disconnect", 1, { connectionId: provisioningId }).expect(404);
+      await keyRequest("/disconnect", 0, { connectionId: provisioningId }).expect(200);
+      await keyRequest("/disconnect", 0, { connectionId: provisioningId }).expect(200);
+      await keyRequest("/api-key", 0, keyBody).expect(409);
+      await launch(0, { connectionId: provisioningId, grantId: provisioned.body.grantId }).expect(422);
+      const rotated = await keyRequest("/api-key", 0, { apiKey: "fixture-new-key", provisioningId: randomUUID() }).expect(201);
+      expect(rotated.body.authorizationGeneration).not.toBe(provisioned.body.authorizationGeneration);
     } finally {
+      validateKey.mockRestore();
       mockedHeartbeat.mockRestore();
       await settings.updateExperimental({ enableIsolatedWorkspaces: previous.enableIsolatedWorkspaces });
       vi.stubEnv("PAPERCLIP_UNTZR_SCOPES", previousScopes);

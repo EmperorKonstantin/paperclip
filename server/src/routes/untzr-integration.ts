@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
@@ -21,7 +21,12 @@ import { assertUntzrExecution, authenticateUntzr, resolveUntzrScope, untzrExecut
 const uuid = z.string().uuid();
 const context = z.object({ subject: untzrSubjectSchema, companyId: uuid, projectId: uuid }).strict();
 const connection = context.extend({ provider: untzrProviderSchema, connectionId: uuid.optional() });
-const apiKey = connection.extend({ apiKey: z.string().trim().min(1).max(32768) });
+const apiKey = connection.extend({
+  apiKey: z.string().trim().min(1).max(32768), provisioningId: uuid.optional(),
+}).refine(body => !body.connectionId || !body.provisioningId, {
+  message: "New provisioning cannot update an existing connection",
+});
+const provisioningMarker = z.object({ projectId: uuid, fingerprint: z.string().regex(/^[a-f0-9]{64}$/) });
 const login = context.extend({ connectionId: uuid.optional(), attempt: uuid.optional() });
 const launch = context.extend({
   provider: untzrProviderSchema, connectionId: uuid, grantId: uuid,
@@ -30,9 +35,10 @@ const launch = context.extend({
   taskBranch: untzrPublicationSchema.shape.taskBranch.optional(),
   startingCommit: untzrPublicationSchema.shape.startingCommit.optional(),
   predecessorIssueId: uuid.optional(),
+  followUp: z.literal("true").optional(),
 }).refine(body => (body.taskBranch === undefined) === (body.startingCommit === undefined) &&
-    (!body.predecessorIssueId || Boolean(body.taskBranch)), {
-  message: "Publisher launches require both the approved task branch and starting commit",
+    (!body.predecessorIssueId || Boolean(body.taskBranch)) && (!body.followUp || Boolean(body.predecessorIssueId)), {
+  message: "Publisher launches require the approved branch and starting commit. Follow-ups also require a predecessor.",
 });
 
 const sourceRequest = context.extend({
@@ -75,8 +81,55 @@ export function untzrIntegrationRoutes(db: Db, storage: StorageService, options:
     const input = createAiConnectionSchema.parse({ ownership: "personal", name: `Untzr ${body.provider}`,
       method: "api_key", provider: body.provider, apiKey: body.apiKey, connectionId: body.connectionId });
     const startedAt = new Date();
-    await validateAiApiKey(body.provider, body.apiKey);
-    res.status(201).json(await service.save(companyId, userId, input, body.apiKey, undefined, startedAt));
+    if (!body.provisioningId) {
+      await validateAiApiKey(body.provider, body.apiKey);
+      res.status(201).json(await service.save(companyId, userId, input, body.apiKey, undefined, startedAt));
+      return;
+    }
+    const id = body.provisioningId;
+    const integrationKey = key(req);
+    if (!integrationKey) throw unauthorized();
+    const fingerprint = createHmac("sha256", integrationKey)
+      .update(JSON.stringify([body.subject, companyId, body.projectId, body.provider, id, body.apiKey]))
+      .digest("hex");
+    async function replay() {
+      const [saved] = await db.select({
+        config: toolConnections.config, enabled: toolConnections.enabled, connectionStatus: toolConnections.status,
+        grantId: connectionGrants.id, grantStatus: connectionGrants.status, revokedAt: connectionGrants.revokedAt,
+        authorizationGeneration: connectionGrants.providerTenant,
+      }).from(toolConnections).innerJoin(connectionGrants, and(eq(connectionGrants.companyId, companyId),
+        eq(connectionGrants.connectionId, toolConnections.id), eq(connectionGrants.kind, "user"),
+        eq(connectionGrants.subjectUserId, userId))).where(and(eq(toolConnections.companyId, companyId),
+        eq(toolConnections.id, id), eq(toolConnections.connectionPurpose, "ai")));
+      if (!saved) {
+        const [collision] = await db.select({ id: toolConnections.id }).from(toolConnections).where(eq(toolConnections.id, id));
+        if (collision) throw conflict("This Untzr provisioning request cannot be replayed");
+        return null;
+      }
+      const marker = provisioningMarker.safeParse(saved.config.untzrApiKeyProvisioning);
+      const metadata = aiConnectionMetadataSchema.safeParse(saved.config.ai);
+      if (!marker.success || marker.data.projectId !== body.projectId || marker.data.fingerprint !== fingerprint ||
+          !metadata.success || metadata.data.provider !== body.provider || metadata.data.method !== "api_key" ||
+          !saved.enabled || saved.connectionStatus !== "active" || saved.grantStatus !== "active" || saved.revokedAt) {
+        throw conflict("This Untzr provisioning request cannot be replayed");
+      }
+      return { connectionId: id, grantId: saved.grantId,
+        authorizationGeneration: saved.authorizationGeneration?.authorizationGeneration ?? saved.grantId };
+    }
+    let binding = await replay();
+    if (!binding) {
+      await validateAiApiKey(body.provider, body.apiKey);
+      try {
+        const saved = await service.save(companyId, userId, input, body.apiKey, undefined, startedAt,
+          undefined, undefined, { id, projectId: body.projectId, fingerprint });
+        binding = { ...saved, authorizationGeneration: saved.grantId };
+      } catch (error) {
+        // A concurrently accepted request may win the globally unique connection ID.
+        binding = await replay();
+        if (!binding) throw error;
+      }
+    }
+    res.status(201).json(binding);
   });
 
   router.post("/disconnect", validate(connection.required({ connectionId: true })), async (req, res) => {
@@ -179,11 +232,18 @@ export function untzrIntegrationRoutes(db: Db, storage: StorageService, options:
       eq(issues.projectWorkspaceId, scope.workspaceId), eq(issues.id, body.predecessorIssueId)))
       .then(rows => rows[0]) : null;
     const prior = predecessor?.untzrExecution ? untzrExecutionSchema.parse(predecessor.untzrExecution) : null;
+    const priorPublication = prior?.publication;
+    const branchMatches = body.followUp
+      ? Boolean(priorPublication?.predecessorIssueId) &&
+        priorPublication?.taskBranch !== body.taskBranch &&
+        priorPublication?.startingCommit === body.startingCommit &&
+        priorPublication?.implementerAgentId === body.agentId
+      : priorPublication?.taskBranch === body.taskBranch;
     if (body.predecessorIssueId && (predecessor?.status !== "done" || !prior?.publication ||
         prior.subject !== scope.subject || prior.userId !== scope.userId ||
         prior.repositoryId !== scope.repositoryId || prior.repository !== scope.repository ||
         prior.provider !== body.provider || prior.connectionId !== body.connectionId || prior.grantId !== body.grantId ||
-        prior.publication.taskBranch !== body.taskBranch || !prior.stageAgents[body.agentId])) {
+        !branchMatches || !prior.stageAgents[body.agentId])) {
       throw forbidden("The stage does not match the approved Untzr predecessor and grant");
     }
     const [grant] = await db.select({ config: toolConnections.config, providerTenant: connectionGrants.providerTenant }).from(toolConnections)
@@ -202,6 +262,7 @@ export function untzrIntegrationRoutes(db: Db, storage: StorageService, options:
       connectionId: body.connectionId, grantId: body.grantId, authorizationGeneration: grant?.providerTenant?.authorizationGeneration,
       publication: body.taskBranch ? {
         taskBranch: body.taskBranch, startingCommit: body.startingCommit, predecessorIssueId: body.predecessorIssueId,
+        implementerAgentId: prior ? priorPublication?.implementerAgentId : body.agentId,
       } : undefined,
       stageAgents: Object.fromEntries(stageAgents.filter(agent => !prior || prior.stageAgents[agent.id]).map(agent => [
         agent.id, { adapter: agent.adapterType, harness: agentHarnessType(agent.adapterType, agent.adapterConfig) },

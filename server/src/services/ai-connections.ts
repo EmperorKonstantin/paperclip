@@ -643,6 +643,7 @@ export function aiConnectionService(db: Db) {
     attemptStartedAt = new Date(),
     managementContext?: ConnectionManagementContext,
     verifiedAccountLabel?: string,
+    untzrApiKeyProvisioning?: { id: string; projectId: string; fingerprint: string },
   ) {
     await managementContext?.reauthorize();
     const routing = "routing" in input ? input.routing : undefined;
@@ -679,7 +680,11 @@ export function aiConnectionService(db: Db) {
       throw unprocessable(
         "Reconnect cannot change the sign-in method or ownership",
       );
-    const id = reconnect?.connection.id ?? randomUUID();
+    if (reconnect?.connection.config.untzrApiKeyProvisioning)
+      throw unprocessable("An Untzr API key must be revoked before replacing it");
+    if (untzrApiKeyProvisioning && (input.connectionId || input.ownership !== "personal" || input.method !== "api_key" || routing))
+      throw unprocessable("Untzr provisioning requires a new personal API key");
+    const id = reconnect?.connection.id ?? untzrApiKeyProvisioning?.id ?? randomUUID();
     const grantId = reconnect?.grant.id ?? randomUUID();
     const persist = () => withAccountHomeSecretMutationLock(undefined, companyId, () => db.transaction(async (tx) => {
       await managementContext?.reauthorize();
@@ -877,6 +882,11 @@ export function aiConnectionService(db: Db) {
               sourceTemplateKey: source,
               ai: { provider: input.provider, method: input.method, ...(routing ? { routing } : {}) },
               aiIsolatedSubscription: input.method === "subscription" && input.provider !== "anthropic",
+              ...(untzrApiKeyProvisioning ? {
+                untzrApiKeyProvisioning: {
+                  projectId: untzrApiKeyProvisioning.projectId, fingerprint: untzrApiKeyProvisioning.fingerprint,
+                },
+              } : {}),
             },
             createdByUserId: userId,
           });
