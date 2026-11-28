@@ -26,7 +26,9 @@ subject from the authenticated Untzr session on the backend.
   provider. Paperclip verifies the key with the provider and stores it in its
   encrypted secret store.
 - `disconnect` accepts `provider` and `connectionId` and revokes the personal
-  grant. Queued runs and retries recheck the grant before execution.
+  grant. Queued runs and retries recheck the grant before execution. Reconnecting
+  after revocation requires a new handoff with a new request ID. Replacing
+  credentials on an active grant preserves authorization for existing handoffs.
 - `codex/start` accepts an optional `connectionId` for replacement. It
   returns an expiring attempt reference. Send that reference as `attempt`
   with the same context and replacement ID to `codex/status`,

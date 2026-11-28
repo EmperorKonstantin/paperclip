@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { Router } from "express";
+import { Router, type Request, type Response } from "express";
 import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { adapterAuthSessions, agents, connectionGrants, toolConnections, type Db } from "@paperclipai/db";
@@ -109,36 +109,38 @@ export function untzrIntegrationRoutes(db: Db, options: Parameters<typeof suppor
       false, undefined, loginScope(body, userId));
     res.status(201).json({ attempt: attempt.sessionId, expiresAt: attempt.expiresAt });
   });
-  for (const command of ["status", "complete", "cancel"] as const) {
-    router.post(`/codex/${command}`, validate(login.required({ attempt: true })), async (req, res) => {
-      requireCodex();
-      const body = login.required({ attempt: true }).parse(req.body);
-      const { companyId, userId } = await resolveScope(body);
-      const id = body.attempt;
-      const [session] = await db.select({ id: adapterAuthSessions.id }).from(adapterAuthSessions)
-        .where(and(eq(adapterAuthSessions.id, id), eq(adapterAuthSessions.companyId, companyId),
-          eq(adapterAuthSessions.startedByUserId, userId), eq(adapterAuthSessions.integrationScope, loginScope(body, userId))));
-      if (!session) throw forbidden("The Codex sign-in attempt is outside this request's scope");
-      const intent = loginIntent(body.connectionId);
-      const scope = loginScope(body, userId);
-      if (command === "complete") {
-        res.status(201).json(await local.complete(companyId, userId, id, intent, undefined, scope));
-      } else if (command === "cancel") {
-        await local.cancel(companyId, userId, id, undefined, scope);
-        res.json({ cancelled: true });
-      } else {
-        const result = await local.check(companyId, userId, intent, id, scope);
-        if (result.status !== "sign_in_required") {
-          res.json({ status: result.status });
-          return;
-        }
-        const authorizationUrl = result.authorizationUrl && new URL(result.authorizationUrl);
-        if (authorizationUrl && (authorizationUrl.origin !== "https://auth.openai.com" ||
-            authorizationUrl.username || authorizationUrl.password)) throw unprocessable("Invalid Codex sign-in destination");
-        res.json({ status: result.status, authorizationUrl: authorizationUrl || undefined, code: result.code });
+  const codexAttempt = login.required({ attempt: true });
+  const codexCommand = (command: "status" | "complete" | "cancel") => async (req: Request, res: Response) => {
+    requireCodex();
+    const body = codexAttempt.parse(req.body);
+    const { companyId, userId } = await resolveScope(body);
+    const id = body.attempt;
+    const [session] = await db.select({ id: adapterAuthSessions.id }).from(adapterAuthSessions)
+      .where(and(eq(adapterAuthSessions.id, id), eq(adapterAuthSessions.companyId, companyId),
+        eq(adapterAuthSessions.startedByUserId, userId), eq(adapterAuthSessions.integrationScope, loginScope(body, userId))));
+    if (!session) throw forbidden("The Codex sign-in attempt is outside this request's scope");
+    const intent = loginIntent(body.connectionId);
+    const scope = loginScope(body, userId);
+    if (command === "complete") {
+      res.status(201).json(await local.complete(companyId, userId, id, intent, undefined, scope));
+    } else if (command === "cancel") {
+      await local.cancel(companyId, userId, id, undefined, scope);
+      res.json({ cancelled: true });
+    } else {
+      const result = await local.check(companyId, userId, intent, id, scope);
+      if (result.status !== "sign_in_required") {
+        res.json({ status: result.status });
+        return;
       }
-    });
-  }
+      const authorizationUrl = result.authorizationUrl && new URL(result.authorizationUrl);
+      if (authorizationUrl && (authorizationUrl.origin !== "https://auth.openai.com" ||
+          authorizationUrl.username || authorizationUrl.password)) throw unprocessable("Invalid Codex sign-in destination");
+      res.json({ status: result.status, authorizationUrl: authorizationUrl || undefined, code: result.code });
+    }
+  };
+  router.post("/codex/status", validate(codexAttempt), codexCommand("status"));
+  router.post("/codex/complete", validate(codexAttempt), codexCommand("complete"));
+  router.post("/codex/cancel", validate(codexAttempt), codexCommand("cancel"));
 
   router.post("/launch", validate(launch), async (req, res) => {
     const body = launch.parse(req.body);
@@ -152,7 +154,7 @@ export function untzrIntegrationRoutes(db: Db, options: Parameters<typeof suppor
       agentHarnessType(agent.adapterType, agent.adapterConfig) === harness);
     if (!stageAgents.some(agent => agent.id === body.agentId))
       throw forbidden("The selected agent cannot run this Untzr provider");
-    const [grant] = await db.select({ config: toolConnections.config }).from(toolConnections)
+    const [grant] = await db.select({ config: toolConnections.config, providerTenant: connectionGrants.providerTenant }).from(toolConnections)
       .innerJoin(connectionGrants, and(eq(connectionGrants.companyId, companyId),
         eq(connectionGrants.connectionId, toolConnections.id), eq(connectionGrants.id, body.grantId),
         eq(connectionGrants.subjectUserId, scope.userId), eq(connectionGrants.kind, "user")))
@@ -161,7 +163,8 @@ export function untzrIntegrationRoutes(db: Db, options: Parameters<typeof suppor
     const metadata = aiConnectionMetadataSchema.safeParse(grant?.config.ai);
     if (!metadata.success || metadata.data.provider !== body.provider) throw forbidden("Choose an approved personal AI connection");
     const parsed = untzrExecutionSchema.safeParse({ ...scope, provider: body.provider, method: metadata.data.method,
-      connectionId: body.connectionId, grantId: body.grantId, stageAgents: Object.fromEntries(stageAgents.map(agent => [
+      connectionId: body.connectionId, grantId: body.grantId, authorizationGeneration: grant?.providerTenant?.authorizationGeneration,
+      stageAgents: Object.fromEntries(stageAgents.map(agent => [
         agent.id, { adapter: agent.adapterType, harness: agentHarnessType(agent.adapterType, agent.adapterConfig) },
       ])), });
     if (!parsed.success) throw forbidden("The approved Untzr agents or connection method are incompatible");
@@ -183,7 +186,8 @@ export function untzrIntegrationRoutes(db: Db, options: Parameters<typeof suppor
         idempotencyKey: handoffId, originFingerprint: fingerprint, onDeduplicated: () => { reused = true; },
         assertCanReuseIssue: async item => {
           if (item.originFingerprint !== fingerprint || !item.untzrExecution ||
-              item.untzrExecution.grantId !== body.grantId) throw conflict("This Untzr request ID already identifies another handoff");
+              item.untzrExecution.grantId !== body.grantId ||
+              item.untzrExecution.authorizationGeneration !== execution.authorizationGeneration) throw conflict("This Untzr request ID already identifies another handoff");
         },
       }, tx);
       if (!reused) await logActivity(tx as unknown as Db, { companyId, actorType: "user", actorId: scope.userId,

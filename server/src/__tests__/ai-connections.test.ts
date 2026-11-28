@@ -1,3 +1,5 @@
+import { githubAppTaskCheckout } from "../services/github-app-credentials.js";
+import * as checkoutBroker from "../services/github-checkout-broker.js";
 import { completeSetupTokenAiConnection } from "../services/setup-token-ai-connection.js";
 import { connectionIntentService } from "../services/connection-intents.js";
 import { connectionIntentDeliveryService } from "../services/connection-intent-delivery.js";
@@ -17,7 +19,7 @@ import { mkdtemp, realpath, rm, access, readFile, writeFile, stat } from "node:f
 import os from "node:os";
 import path from "node:path";
 import { and, eq, sql } from "drizzle-orm";
-import { createDb, type Db, activityLog, companies, agents, agentTaskSessions, heartbeatRuns, companyMemberships, connectionGrants, toolApplications, connectionGrantDelegations, connectionGrantMembers, toolConnections, toolConnectionInstalls, aiConnectionDefaults, aiProviderDefaults, adapterAuthSessions, environments, plugins, issues, issueThreadInteractions, issueRecoveryActions, connectionIntentDeliveries, agentWakeupRequests, companySecrets, companySecretVersions, secretAccessEvents, userSecretDefinitions, principalPermissionGrants } from "@paperclipai/db";
+import { createDb, type Db, activityLog, authUsers, companies, agents, projects, projectAccessMembers, projectWorkspaces, agentTaskSessions, heartbeatRuns, companyMemberships, connectionGrants, toolApplications, connectionGrantDelegations, connectionGrantMembers, toolConnections, toolConnectionInstalls, aiConnectionDefaults, aiProviderDefaults, adapterAuthSessions, environments, plugins, issues, issueThreadInteractions, issueRecoveryActions, connectionIntentDeliveries, agentWakeupRequests, companySecrets, companySecretVersions, secretAccessEvents, userSecretDefinitions, principalPermissionGrants } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { fetchCompanyQuotaWindows } from "../services/quota-windows.js";
 import { quotaCredentialRecoveryPath, quotaCredentialRecovery, quotaCredentialHash } from "../services/quota-credential-recovery.js";
@@ -101,6 +103,89 @@ describe("managed AI connections", () => {
     await db.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.id, alice.grantId));
     await expect(select(users[0], alice)).rejects.toThrow();
     await expect(select(users[1], bob)).resolves.toMatchObject({ attribution: { grantId: bob.grantId } });
+  });
+
+  it("preserves active rotation and invalidates queued Untzr authorization after reconnect", async () => {
+    const userId = "untzr-rotation";
+    await db.insert(companyMemberships).values({
+      companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member",
+    });
+    const saved = await create(userId, userId);
+    const select = (pinnedPersonalGrant: typeof saved & { authorizationGeneration?: string }) =>
+      service.select({ ...input, userId, pinnedPersonalGrant, allowUninstalledPersonal: true });
+    const reconnect = { ...binding, ownership: "personal" as const, name: userId, apiKey: "fixture",
+      agentIds: [], allAgents: true, connectionId: saved.connectionId };
+
+    await service.save(companyId, userId, reconnect, "fixture-rotated");
+    expect(await service.credential(await select(saved))).toBe("fixture-rotated");
+
+    await db.update(connectionGrants).set({ status: "revoked", revokedAt: new Date(), updatedAt: new Date() })
+      .where(eq(connectionGrants.id, saved.grantId));
+    await expect(select(saved)).rejects.toThrow("Reconnect");
+    await service.save(companyId, userId, reconnect, "fixture-reconnected");
+    await expect(select(saved)).rejects.toThrow("authorization");
+    const current = await service.select({ ...input, userId });
+    const authorizationGeneration = current.grant.providerTenant?.authorizationGeneration;
+    expect(authorizationGeneration).toEqual(expect.any(String));
+    expect(await service.credential(await select({ ...saved, authorizationGeneration }))).toBe("fixture-reconnected");
+  });
+
+  it("checks Untzr checkout stage and live grant before requesting GitHub credentials", async () => {
+    const userId = "untzr-checkout";
+    const now = new Date();
+    await db.insert(authUsers).values({ id: userId, name: userId, email: "checkout@example.test", createdAt: now, updatedAt: now });
+    await db.insert(companyMemberships).values({
+      companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "owner",
+    });
+    const grant = await create(userId, userId);
+    const [project] = await db.insert(projects).values({ companyId, name: "Checkout", visibility: "private" }).returning();
+    const repository = "example/checkout";
+    const repoUrl = `https://github.com/${repository}.git`;
+    const [workspace] = await db.insert(projectWorkspaces).values({
+      companyId, projectId: project.id, name: "Checkout", repoUrl, repoRef: "main",
+      metadata: { githubRepositoryId: "42" },
+    }).returning();
+    const [approved, other] = await db.insert(agents).values(["Approved", "Other"].map(name => ({
+      companyId, name, adapterType: "paperclip_runner" as const, adapterConfig: { provider: "acpx", acpxAgent: "claude" },
+    }))).returning();
+    await db.insert(projectAccessMembers).values([
+      { companyId, projectId: project.id, subjectType: "user", subjectId: userId },
+      { companyId, projectId: project.id, subjectType: "agent", subjectId: approved.id },
+      { companyId, projectId: project.id, subjectType: "agent", subjectId: other.id },
+    ]);
+    const binding = { companyId, projectId: project.id, workspaceId: workspace.id, repositoryId: "42" };
+    const scope = { ...binding, subject: userId, userId, repository, ref: "main" };
+    const [issue] = await db.insert(issues).values({
+      companyId, projectId: project.id, projectWorkspaceId: workspace.id, title: "Git checkout",
+      assigneeAgentId: other.id, untzrExecution: { ...scope, ...grant, provider: "anthropic", method: "api_key",
+        stageAgents: { [approved.id]: { adapter: "paperclip_runner", harness: "claude_local" } } },
+    }).returning();
+    const checkout = (id: string) => githubAppTaskCheckout(db, companyId, issue.id, id, repoUrl);
+    const previousScopes = process.env.PAPERCLIP_UNTZR_SCOPES;
+    const previousProjects = process.env.PAPERCLIP_GITHUB_APP_PROJECTS;
+    vi.stubEnv("PAPERCLIP_UNTZR_SCOPES", JSON.stringify([{ ...scope, agentIds: [approved.id, other.id] }]));
+    vi.stubEnv("PAPERCLIP_GITHUB_APP_PROJECTS", JSON.stringify([{ ...binding, agentIds: [approved.id, other.id] }]));
+    const broker = vi.spyOn(checkoutBroker, "requestGitHubInstallationCredential").mockResolvedValue("fixture-installation-token");
+    try {
+      await expect(checkout(other.id)).rejects.toThrow("approved Untzr user, agent");
+      await db.update(issues).set({ assigneeAgentId: approved.id }).where(eq(issues.id, issue.id));
+      await expect(checkout(approved.id)).resolves.toBe("fixture-installation-token");
+      expect(broker).toHaveBeenCalledOnce();
+      broker.mockClear();
+      await db.update(issues).set({ projectWorkspaceId: null }).where(eq(issues.id, issue.id));
+      await expect(checkout(approved.id)).rejects.toThrow("approved Untzr project and repository");
+      await db.update(issues).set({ projectWorkspaceId: workspace.id }).where(eq(issues.id, issue.id));
+      await db.update(agents).set({ adapterConfig: { provider: "codex" } }).where(eq(agents.id, approved.id));
+      await expect(checkout(approved.id)).rejects.toThrow("approved Untzr user, agent");
+      await db.update(agents).set({ adapterConfig: approved.adapterConfig }).where(eq(agents.id, approved.id));
+      await db.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.id, grant.grantId));
+      await expect(checkout(approved.id)).rejects.toThrow("Reconnect");
+      expect(broker).not.toHaveBeenCalled();
+    } finally {
+      broker.mockRestore();
+      vi.stubEnv("PAPERCLIP_UNTZR_SCOPES", previousScopes);
+      vi.stubEnv("PAPERCLIP_GITHUB_APP_PROJECTS", previousProjects);
+    }
   });
 
   it.each([

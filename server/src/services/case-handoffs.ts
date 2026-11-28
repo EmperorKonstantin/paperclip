@@ -504,7 +504,8 @@ export function caseHandoffService(db: Db) {
           issue = await issueService(tx).create(companyId, { title: caseRow!.title, description: caseRow!.summary ?? caseRow!.title,
             projectId, parentId: parent?.id ?? null, status: "todo", workMode: "standard", assigneeAgentId: input.toAgentId,
             createdByAgentId: actor.type === "agent" ? actor.agentId : null, createdByUserId: actor.type === "board" ? actor.userId ?? null : null,
-            actorRunId: source?.id ?? null, actorResponsibleUserId: actor.onBehalfOfUserId ?? actor.userId ?? null,
+            actorRunId: source?.id ?? null, authenticatedCreatingRunId: actor.source === "agent_jwt" ? source?.id : null,
+            actorResponsibleUserId: actor.onBehalfOfUserId ?? actor.userId ?? null,
             workspaceSelectionActor: actor, originRunId: source?.id ?? null, idempotencyKey: `case-handoff:${id}`, allowDuplicate: true,
           }, tx);
           publications.push((await persistActivity(tx, { companyId, ...who, agentId: actor.type === "agent" ? actor.agentId : null,

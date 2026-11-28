@@ -3,7 +3,7 @@ import express from "express";
 import { eq } from "drizzle-orm";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { activityLog, agents, companies, createDb, heartbeatRuns, issues, projects } from "@paperclipai/db";
+import { activityLog, agents, companies, createDb, heartbeatRuns, issues, projects, projectWorkspaces } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { issueRoutes } from "../routes/issues.js";
 import { issueService } from "../services/issues.js";
@@ -175,4 +175,34 @@ describePostgres("tasks created from an issue", () => {
     const matches = await issueService(db).list(companyId, { createdFromIssueId: sourceId });
     expect(matches.map((row) => row.id)).toContain(created.issue.id);
   });
+  it("keeps the authenticated creating run's Untzr authorization when given unrelated provenance", async () => {
+    const [project] = await db.insert(projects).values({ companyId, name: "Untzr follow-ups" }).returning();
+    const [workspace] = await db.insert(projectWorkspaces).values({
+      companyId, projectId: project.id, name: "Untzr checkout", cwd: "/tmp/untzr-fixture",
+    }).returning();
+    const alice = { userId: "alice", grantId: randomUUID(), projectId: project.id, workspaceId: workspace.id };
+    const bob = { ...alice, userId: "bob", grantId: randomUUID() };
+    const [source, provenance] = await db.insert(issues).values([
+      { companyId, title: "Alice execution", projectId: project.id, untzrExecution: alice },
+      { companyId, title: "Bob execution", projectId: project.id, untzrExecution: bob },
+    ]).returning();
+    const [actorRun, originRun] = await db.insert(heartbeatRuns).values([
+      { companyId, agentId, contextSnapshot: { issueId: source.id } },
+      { companyId, agentId, contextSnapshot: { issueId: provenance.id } },
+    ]).returning();
+
+    const input = {
+      title: "Follow-up", createdByAgentId: agentId, actorRunId: actorRun.id, authenticatedCreatingRunId: actorRun.id,
+      originRunId: originRun.id, projectId: project.id, projectWorkspaceId: workspace.id,
+    };
+    const created = await issueService(db).create(companyId, input);
+    expect(created).toMatchObject({ originRunId: originRun.id, responsibleUserId: "alice", untzrExecution: alice });
+    const provenanceOnly = await issueService(db).create(companyId, {
+      ...input, title: "Provenance only", authenticatedCreatingRunId: null,
+    });
+    expect(provenanceOnly).toMatchObject({ originRunId: originRun.id, untzrExecution: null });
+    await expect(issueService(db).create(companyId, { ...input, title: "Conflicting follow-up", parentId: provenance.id }))
+      .rejects.toThrow("approved Untzr");
+  });
+
 });

@@ -275,7 +275,7 @@ export function aiConnectionService(db: Db) {
     runnerProvider?: unknown;
     acpxAgent?: unknown;
     allowUninstalledPersonal?: boolean;
-    pinnedPersonalGrant?: { connectionId: string; grantId: string };
+    pinnedPersonalGrant?: { connectionId: string; grantId: string; authorizationGeneration?: string };
     allowUninstalledShared?: boolean;
     allowLegacyValidation?: boolean;
     binding: AiConnectionBinding;
@@ -333,6 +333,8 @@ export function aiConnectionService(db: Db) {
     if (!row)
       throw aiConnectionConfigurationFailure("ai_connection_missing", "The selected AI connection is unavailable");
     const { connection, grant } = row;
+    if (pinnedPersonalGrant && pinnedPersonalGrant.authorizationGeneration !== grant.providerTenant?.authorizationGeneration)
+      throw forbidden("The pinned AI authorization has been revoked. Start a new handoff.");
     const metadata = aiConnectionMetadataSchema.safeParse(connection.config.ai);
     if (
       !metadata.success ||
@@ -721,6 +723,7 @@ export function aiConnectionService(db: Db) {
         )
           throw forbidden("Login target mismatch");
       }
+      let authorizationGeneration: string | undefined;
       if (reconnect) {
         const [current] = await tx
           .select()
@@ -729,10 +732,15 @@ export function aiConnectionService(db: Db) {
           .for("update");
         if (
           !current ||
+          current.status !== reconnect.grant.status ||
+          current.providerTenant?.authorizationGeneration !== reconnect.grant.providerTenant?.authorizationGeneration ||
           current.updatedAt.getTime() !== reconnect.grant.updatedAt.getTime() ||
           current.updatedAt.getTime() > attemptStartedAt.getTime()
         )
           throw unprocessable("The connection changed. Start reconnect again.");
+        authorizationGeneration = current.kind === "user" && (current.status === "revoked" || current.revokedAt)
+          ? randomUUID()
+          : current.providerTenant?.authorizationGeneration;
       }
       let secretId = reconnect?.grant.credentialSecretRefs.find(
         (r) => r.configPath === "ai.credential",
@@ -902,18 +910,21 @@ export function aiConnectionService(db: Db) {
           versionSelector: "latest" as const,
         },
       ] : [];
-      if (reconnect)
+      if (reconnect) {
         await tx
           .update(connectionGrants)
           .set({
             status: "active",
-            providerTenant: accountLabel ? { name: accountLabel } : {},
+            providerTenant: {
+              ...(accountLabel ? { name: accountLabel } : {}),
+              ...(authorizationGeneration ? { authorizationGeneration } : {}),
+            },
             credentialSecretRefs: refs,
             revokedAt: null,
             updatedAt: new Date(),
           })
           .where(eq(connectionGrants.id, grantId));
-      else
+      } else
         await tx
           .insert(connectionGrants)
           .values({

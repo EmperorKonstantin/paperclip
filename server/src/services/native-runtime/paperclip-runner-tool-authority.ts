@@ -2296,6 +2296,7 @@ export class PaperclipRunnerToolAuthority {
         originFingerprint: inputFingerprint,
         actorAgentId: this.binding.agentId,
         actorRunId: this.binding.runId,
+        authenticatedCreatingRunId: this.binding.runId,
         idempotencyKey: durableIdempotencyKey,
         onDeduplicated: () => { deduplicated = true; },
       };

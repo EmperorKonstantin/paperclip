@@ -218,6 +218,8 @@ export const connectionGrants = pgTable(
           expiresAt?: string;
         };
       };
+      /** Stable through active credential rotation and replaced after AI grant revocation. */
+      authorizationGeneration?: string;
       slackSearch?: { endpointId: string; workspaceId: string; slackUserId: string; clientRevision: string };
       github?: {
         userId: string;

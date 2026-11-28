@@ -30,6 +30,7 @@ export const untzrExecutionSchema = scopeSchema.omit({ agentIds: true }).extend(
   method: z.enum(["api_key", "subscription"]),
   connectionId: uuid,
   grantId: uuid,
+  authorizationGeneration: uuid.optional(),
 }).strict();
 export type UntzrExecution = z.infer<typeof untzrExecutionSchema>;
 
@@ -39,8 +40,8 @@ export function authenticateUntzr(token: string | undefined, env = process.env) 
     timingSafeEqual(createHash("sha256").update(token).digest(), Buffer.from(expected, "hex")));
 }
 
-export async function resolveUntzrScope(db: Db, subject: string, companyId: string, projectId: string) {
-  const raw = process.env.PAPERCLIP_UNTZR_SCOPES;
+export async function resolveUntzrScope(db: Db, subject: string, companyId: string, projectId: string, env = process.env) {
+  const raw = env.PAPERCLIP_UNTZR_SCOPES;
   const scopes = raw ? z.array(scopeSchema).parse(JSON.parse(raw)) : [];
   const matches = scopes.filter(scope => scope.subject === subject &&
     scope.companyId === companyId && scope.projectId === projectId);
@@ -62,7 +63,7 @@ export async function resolveUntzrScope(db: Db, subject: string, companyId: stri
     .innerJoin(projects, and(eq(projects.id, projectWorkspaces.projectId), eq(projects.companyId, companyId)))
     .where(and(eq(projectWorkspaces.companyId, companyId), eq(projectWorkspaces.projectId, projectId),
       eq(projectWorkspaces.id, scope.workspaceId)));
-  const binding = githubAppProjectBinding(companyId, projectId);
+  const binding = githubAppProjectBinding(companyId, projectId, env);
   const source = workspace?.source;
   if (!source?.repoUrl || workspace.project.archivedAt || workspace.project.visibility !== "private" ||
       binding?.workspaceId !== scope.workspaceId || binding.repositoryId !== scope.repositoryId ||
@@ -86,12 +87,12 @@ export async function assertUntzrExecution(db: Db, execution: UntzrExecution, in
   agentId: string;
   adapter: string;
   config: Record<string, unknown>;
-}) {
+}, env = process.env) {
   if (execution.companyId !== input.companyId || execution.projectId !== input.projectId ||
       execution.workspaceId !== input.workspaceId) {
     throw forbidden("The task is outside its approved Untzr project and repository");
   }
-  const scope = await resolveUntzrScope(db, execution.subject, execution.companyId, execution.projectId);
+  const scope = await resolveUntzrScope(db, execution.subject, execution.companyId, execution.projectId, env);
   const stage = execution.stageAgents[input.agentId];
   if (scope.userId !== execution.userId || scope.repository !== execution.repository ||
       scope.repositoryId !== execution.repositoryId || scope.ref !== execution.ref ||
@@ -100,7 +101,7 @@ export async function assertUntzrExecution(db: Db, execution: UntzrExecution, in
       stage.harness !== (execution.provider === "openai" ? "codex_local" : "claude_local") ||
       input.config.homeMode === "preconfigured" ||
       (execution.method === "subscription" &&
-        (execution.provider !== "openai" || process.env.PAPERCLIP_UNTZR_CODEX_LOGIN !== "enabled"))) {
+        (execution.provider !== "openai" || env.PAPERCLIP_UNTZR_CODEX_LOGIN !== "enabled"))) {
     throw forbidden("The task's approved Untzr user, agent, or authentication method is unavailable");
   }
   const selection = await aiConnectionService(db).select({

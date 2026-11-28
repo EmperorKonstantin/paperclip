@@ -118,6 +118,7 @@ const apiPrefixes: Record<string, string> = {
   "voice-sessions.ts": "/api",
   "tool-gateway.ts": "/api",
   "user-profiles.ts": "/api",
+  "untzr-integration.ts": "/api/private/untzr",
   "workspace-preferences.ts": "/api",
   "workload-identity.ts": "/api",
   "agent-setup-progress.ts": "/api",
@@ -156,6 +157,15 @@ const explicitOpenApiOperationCoverageExclusions = new Set([
   "POST /api/customer-success/v1/read",
   "POST /api/customer-success/v1/read-v2",
   "POST /api/customer-success/v1/run-liveness",
+  // Dedicated Untzr integration bearer. The private contract is in doc/untzr-provider-integration.md.
+  "POST /api/private/untzr/status",
+  "POST /api/private/untzr/api-key",
+  "POST /api/private/untzr/disconnect",
+  "POST /api/private/untzr/codex/start",
+  "POST /api/private/untzr/codex/status",
+  "POST /api/private/untzr/codex/complete",
+  "POST /api/private/untzr/codex/cancel",
+  "POST /api/private/untzr/launch",
   // OAuth discovery and protocol endpoints have their own metadata contract;
   // browser connection-management operations remain documented in the board API.
   // Markdown rendering of the separately documented assistant setup page.
@@ -1380,6 +1390,16 @@ describe("openapi routes", () => {
     ]));
     expect(operation.responses["413"]).toBeDefined();
     expect(operation.description).toContain("save_api_response");
+  });
+
+  it("registers every Untzr operation as private", () => {
+    const prefix = "POST /api/private/untzr/";
+    const operations = [...explicitOpenApiOperationCoverageExclusions].filter(route => route.startsWith(prefix));
+    const { excludedRoutes } = loadActualRoutes();
+    const { routes: specRoutes } = loadSpecRoutes();
+    expect(operations).toHaveLength(8);
+    expect([...excludedRoutes].filter(route => route.startsWith(prefix)).sort()).toEqual(operations.sort());
+    expect([...specRoutes].filter(route => route.startsWith(prefix))).toEqual([]);
   });
 
   it("covers the mounted server routes exactly", () => {

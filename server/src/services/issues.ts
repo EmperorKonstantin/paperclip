@@ -2084,6 +2084,8 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId" | "title" |
   watchdog?: { agentId: string; instructions?: string | null } | null;
   watchdogActorRunId?: string | null;
   actorRunId?: string | null;
+  /** Run identity verified by the caller's authentication boundary. */
+  authenticatedCreatingRunId?: string | null;
   actorResponsibleUserId?: string | null;
   trustExplicitResponsibleUserId?: boolean;
   idempotencyKey?: string | null;
@@ -5357,6 +5359,7 @@ const issueListSelect = {
   originRunId: issues.originRunId,
   originIssueId: issues.originIssueId,
   originIdentityContextId: issues.originIdentityContextId,
+  untzrExecution: sql<null>`null`,
   continuationIdentityContextId: issues.continuationIdentityContextId,
   originFingerprint: issues.originFingerprint,
   requestDepth: issues.requestDepth,
@@ -10629,7 +10632,8 @@ export function issueService(db: Db) {
     ) => {
       const pluginOrigin = currentPluginInteractionOrigin();
       if (pluginOrigin) data = { ...data, createdByAgentId: pluginOrigin.agentId,
-        createdByUserId: null, actorRunId: pluginOrigin.runId ?? data.actorRunId };
+        createdByUserId: null, actorRunId: pluginOrigin.runId ?? data.actorRunId,
+        authenticatedCreatingRunId: pluginOrigin.runId ?? data.authenticatedCreatingRunId };
       const {
         workspaceSelection, workspaceSelectionSource = "explicit", workspaceSelectionActor,
         initialPlan,
@@ -10642,6 +10646,7 @@ export function issueService(db: Db) {
         watchdog,
         watchdogActorRunId,
         actorRunId,
+        authenticatedCreatingRunId,
         actorResponsibleUserId,
         trustExplicitResponsibleUserId,
         idempotencyKey: rawIdempotencyKey,
@@ -11129,16 +11134,17 @@ export function issueService(db: Db) {
           companyId, ...conversationHandoff,
           userId: issueData.createdByUserId, agentId: issueData.createdByAgentId,
         }) : null;
-        // The task the creating run was bound to, when a run created this task.
-        let runSourceIssueId: string | null = null;
-        const sourceRunId = issueData.originRunId ?? actorRunId;
-        if (sourceRunId && isUuidLike(sourceRunId)) {
-          const [sourceRun] = await tx.select().from(heartbeatRuns)
-            .where(and(eq(heartbeatRuns.id, sourceRunId), eq(heartbeatRuns.companyId, companyId)));
-          // Same binding rules as creation-source reads: native identity, issue
-          // scope, then legacy task context (including identifiers), company-scoped.
-          if (sourceRun) runSourceIssueId = (await loadRunBoundIssue(tx as unknown as Db, sourceRun))?.id ?? null;
-        }
+        const boundIssueId = async (runId: string | null | undefined) => {
+          if (!runId || !isUuidLike(runId)) return null;
+          const [run] = await tx.select().from(heartbeatRuns)
+            .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)));
+          return run ? (await loadRunBoundIssue(tx as unknown as Db, run))?.id ?? null : null;
+        };
+        const provenanceRunId = issueData.originRunId ?? actorRunId;
+        const creatingRunIssueId = await boundIssueId(authenticatedCreatingRunId);
+        const runSourceIssueId = provenanceRunId === authenticatedCreatingRunId
+          ? creatingRunIssueId
+          : await boundIssueId(provenanceRunId);
         // Privacy follows structure: the requested parent (even when placed
         // beside it), the chat that handed this off, or the run's task.
         let privacyParentIssueId = requestedParentId ?? handoffSource?.id ?? runSourceIssueId;
@@ -11200,20 +11206,22 @@ export function issueService(db: Db) {
               .then((rows) => rows.length > 0));
           if (!originPublic) originIssueId = null;
         }
-        // Follow the creating run before the requested parent. A stage cannot
-        // discard its authorizing account by creating work under another task.
-        const untzrSources = [...new Set([runSourceIssueId, privacyParentIssueId].filter((id): id is string => Boolean(id)))];
+        // A caller can supply readable provenance. Execution authority comes
+        // from the authenticated creating run, the parent, and the accepted handoff.
+        const untzrSources = [...new Set([creatingRunIssueId, requestedParentId, issueData.parentId, handoffSource?.id]
+          .filter((id): id is string => Boolean(id)))];
         const inheritedUntzr = untzrSources.length ? await tx.select({ execution: issues.untzrExecution })
           .from(issues).where(and(eq(issues.companyId, companyId), inArray(issues.id, untzrSources))) : [];
-        const inheritedExecution = inheritedUntzr.find(source => source.execution)?.execution;
-        if (inheritedExecution && (inheritedUntzr.some(source => source.execution &&
-            !isDeepStrictEqual(source.execution, inheritedExecution)) ||
+        const executionSources = [...inheritedUntzr.map(source => source.execution), issueData.untzrExecution]
+          .filter(execution => execution != null);
+        const [inheritedExecution] = executionSources;
+        if (inheritedExecution && (executionSources.some(execution => !isDeepStrictEqual(execution, inheritedExecution)) ||
             issueData.projectId !== inheritedExecution.projectId || projectWorkspaceId !== inheritedExecution.workspaceId)) {
           throw forbidden("A follow-up must keep its approved Untzr project and workspace");
         }
         const values = {
           ...issueData,
-          untzrExecution: inheritedExecution ?? issueData.untzrExecution,
+          untzrExecution: inheritedExecution,
           workspaceSelection: workspaceIntent,
           visibility,
           privacyRootIssueId,

@@ -250,6 +250,7 @@ function readNonEmptyString(value: unknown): string | null {
 export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExecutionInput): Promise<HeartbeatRuntimeExecutionResult> {
   const { run, agent, options } = input;
   const { issueRef, issueContext, context, issueId, taskKey, executionContinuation } = input.task;
+  const unattended = issueContext?.executionPolicy?.unattended === true;
   const { nativeRuntimeResolution, nativeExecution, nativeRunnerInstanceId, adapter, runtimeForAdapter, getNativeFreshSessionHandoff, getFreshSessionHandoff, runOptions } = input.runtime;
   const { persistedExecutionWorkspace, executionWorkspace, executionTarget, workspaceOperationRecorder, nativeWorkspaceSync, workspaceRestoreSource, remoteExecution } = input.workspace;
   const remoteWorkspaceAuthority = readRemoteWorkspaceAuthority(persistedExecutionWorkspace?.metadata);
@@ -724,7 +725,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               // configured provider values and the server-selected
               // workspace boundary authoritative.
               managedGitHub: !useHostGitHub && githubSelection.configured,
-              unattended: issueContext?.executionPolicy?.unattended,
+              unattended,
               billingIdentity: managedAiRuntime ? { provider: managedAiRuntime.attribution.provider, biller: managedAiRuntime.attribution.provider === "openai" ? resolveManagedOpenAiBilling(managedAiRuntime.config.managedAiRouting)?.biller ?? managedAiRuntime.attribution.provider : managedAiRuntime.attribution.provider, billingType: managedAiRuntime.attribution.method === "subscription" ? "subscription_included" : "metered_api" } : undefined,
               managedAiCredentialIdentity: managedAiRuntime?.identity,
               managedAiAccountIdentity: managedAiRuntime?.sessionIdentity,
@@ -985,7 +986,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       if (!guardedDispatch.dispatched) return { dispatched: false };
       adapterResult = await guardedDispatch.resultPromise;
     }
-    if (issueContext?.executionPolicy?.unattended) await assertNoUnattendedInputRequest(db, run.companyId, run.id);
+    if (unattended) await assertNoUnattendedInputRequest(db, run.companyId, run.id);
     adapterResult = identityRedactor.redact(adapterResult);
     if (run.runtimeMode === "legacy" && hasWorkspaceRestoreFailure(adapterResult.resultJson)
         && executionTarget?.kind === "remote" && executionTarget.transport === "sandbox") {
