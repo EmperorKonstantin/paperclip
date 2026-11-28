@@ -1,6 +1,6 @@
 {
-  "id": "8ddb0345-f9e8-4dde-8156-391f71d858b1",
-  "prevId": "2f88a046-845e-47f5-ad81-b3b338c79fb5",
+  "id": "0da9751d-8cb0-4a3e-8fb6-6904b9b0eaf3",
+  "prevId": "67845b20-ef7f-42e5-8609-7c1722662c9b",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -1564,6 +1564,12 @@
         },
         "connection_method": {
           "name": "connection_method",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "integration_scope": {
+          "name": "integration_scope",
           "type": "text",
           "primaryKey": false,
           "notNull": false
@@ -26298,6 +26304,160 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.document_annotation_comment_reactions": {
+      "name": "document_annotation_comment_reactions",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "company_id": {
+          "name": "company_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "comment_id": {
+          "name": "comment_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "reaction": {
+          "name": "reaction",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "actor_type": {
+          "name": "actor_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "actor_id": {
+          "name": "actor_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "removed_at": {
+          "name": "removed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "document_annotation_comment_reactions_company_comment_idx": {
+          "name": "document_annotation_comment_reactions_company_comment_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "comment_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "document_annotation_comment_reactions_comment_reaction_actor_idx": {
+          "name": "document_annotation_comment_reactions_comment_reaction_actor_idx",
+          "columns": [
+            {
+              "expression": "comment_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "reaction",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "actor_type",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "actor_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "document_annotation_comment_reactions_company_id_companies_id_fk": {
+          "name": "document_annotation_comment_reactions_company_id_companies_id_fk",
+          "tableFrom": "document_annotation_comment_reactions",
+          "tableTo": "companies",
+          "columnsFrom": [
+            "company_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "document_annotation_comment_reactions_comment_id_document_annotation_comments_id_fk": {
+          "name": "document_annotation_comment_reactions_comment_id_document_annotation_comments_id_fk",
+          "tableFrom": "document_annotation_comment_reactions",
+          "tableTo": "document_annotation_comments",
+          "columnsFrom": [
+            "comment_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "document_annotation_comment_reactions_reaction_chk": {
+          "name": "document_annotation_comment_reactions_reaction_chk",
+          "value": "\"document_annotation_comment_reactions\".\"reaction\" in ('done', 'check', 'thumbs_up', 'question')"
+        },
+        "document_annotation_comment_reactions_actor_type_chk": {
+          "name": "document_annotation_comment_reactions_actor_type_chk",
+          "value": "\"document_annotation_comment_reactions\".\"actor_type\" in ('agent', 'user')"
+        }
+      },
+      "isRLSEnabled": false
+    },
     "public.document_annotation_comments": {
       "name": "document_annotation_comments",
       "schema": "",
@@ -27386,6 +27546,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": false
+        },
+        "signed_untzr_source": {
+          "name": "signed_untzr_source",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
         },
         "created_by_run_id": {
           "name": "created_by_run_id",
@@ -38843,6 +39010,13 @@
           "primaryKey": false,
           "notNull": false
         },
+        "signed_untzr_source": {
+          "name": "signed_untzr_source",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
         "originating_run_id": {
           "name": "originating_run_id",
           "type": "uuid",
@@ -40106,6 +40280,75 @@
             "id"
           ],
           "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.issue_github_handoffs": {
+      "name": "issue_github_handoffs",
+      "schema": "",
+      "columns": {
+        "issue_id": {
+          "name": "issue_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "ancestor_ids": {
+          "name": "ancestor_ids",
+          "type": "uuid[]",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "operation_id": {
+          "name": "operation_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "action": {
+          "name": "action",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "sha": {
+          "name": "sha",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "started_at": {
+          "name": "started_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "issue_github_handoffs_issue_id_issues_id_fk": {
+          "name": "issue_github_handoffs_issue_id_issues_id_fk",
+          "tableFrom": "issue_github_handoffs",
+          "tableTo": "issues",
+          "columnsFrom": [
+            "issue_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
           "onUpdate": "no action"
         }
       },
@@ -44229,6 +44472,12 @@
         "responsible_user_id": {
           "name": "responsible_user_id",
           "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "untzr_execution": {
+          "name": "untzr_execution",
+          "type": "jsonb",
           "primaryKey": false,
           "notNull": false
         },

@@ -4,9 +4,9 @@ import { notifyIssueRecovery, notifyIssueGraphRecovery } from "./issue-recovery-
 import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { documentRevisions, documents, issueDocuments, issues } from "@paperclipai/db";
+import { documentRevisions, documents, heartbeatRuns, issueDocuments, issues } from "@paperclipai/db";
 import { ISSUE_DOCUMENT_BATCH_MAX_IDS, isSystemIssueDocumentKey, issueDocumentKeySchema } from "@paperclipai/shared";
-import { conflict, notFound, payloadTooLarge, unprocessable } from "../errors.js";
+import { conflict, forbidden, notFound, payloadTooLarge, unprocessable } from "../errors.js";
 import { isUniqueViolation } from "../db-errors.js";
 import { insertRowsInChunks } from "./batch-insert.js";
 import type { ImportIssueDocumentRow } from "./import-write-types.js";
@@ -205,7 +205,7 @@ export function documentService(db: Db) {
     },
 
     /** Bounded receipt read: never load every historical body for one revision. */
-    getIssueDocumentRevision: async (issueId: string, rawKey: string, revisionId: string) => {
+    getIssueDocumentRevision: async (issueId: string, rawKey: string, revisionId: string, options?: { requireSignedUntzrSource?: boolean }) => {
       const key = normalizeDocumentKey(rawKey);
       const [revision] = await db.select({
         id: documentRevisions.id, companyId: documentRevisions.companyId,
@@ -218,7 +218,8 @@ export function documentService(db: Db) {
       }).from(issueDocuments)
         .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
         .innerJoin(documentRevisions, and(eq(documentRevisions.documentId, documents.id), eq(documentRevisions.companyId, documents.companyId)))
-        .where(and(eq(issueDocuments.issueId, issueId), eq(issueDocuments.key, key), eq(documentRevisions.id, revisionId))).limit(1);
+        .where(and(eq(issueDocuments.issueId, issueId), eq(issueDocuments.key, key), eq(documentRevisions.id, revisionId),
+          options?.requireSignedUntzrSource ? eq(documentRevisions.signedUntzrSource, true) : undefined)).limit(1);
       return revision ? { ...revision, isLatest: revision.latestRevisionId === revision.id } : null;
     },
 
@@ -259,6 +260,7 @@ export function documentService(db: Db) {
       createdByAgentId?: string | null;
       createdByUserId?: string | null;
       createdByRunId?: string | null;
+      signedUntzrSource?: boolean;
       sourceTrust?: typeof documents.$inferInsert.sourceTrust;
       lockedDocumentStrategy?: "conflict" | "create_new_document";
     }, options: { initialTaskCreation?: boolean } = {}) => {
@@ -314,6 +316,24 @@ export function documentService(db: Db) {
             ], lock: true,
           });
 
+          if (input.signedUntzrSource) {
+            const [run] = input.createdByRunId && input.createdByAgentId && !input.createdByUserId
+              ? await tx.select({
+                  issueId: heartbeatRuns.issueId,
+                  nativeIssueId: heartbeatRuns.nativeIssueId,
+                }).from(heartbeatRuns).where(and(
+                  eq(heartbeatRuns.id, input.createdByRunId),
+                  eq(heartbeatRuns.companyId, issue.companyId),
+                  eq(heartbeatRuns.agentId, input.createdByAgentId),
+                  eq(heartbeatRuns.status, "running"),
+                )).for("update")
+              : [];
+            if (!run || (run.issueId ?? run.nativeIssueId) !== issue.id ||
+                (run.nativeIssueId && run.nativeIssueId !== issue.id)) {
+              throw forbidden("Untzr source reports require the authenticated active task run");
+            }
+          }
+
           if (existing) {
             if (existing.lockedAt) {
               if (input.lockedDocumentStrategy === "create_new_document") {
@@ -359,6 +379,7 @@ export function documentService(db: Db) {
                     createdByAgentId: input.createdByAgentId ?? null,
                     createdByUserId: input.createdByUserId ?? null,
                     createdByRunId: input.createdByRunId ?? null,
+                    signedUntzrSource: input.signedUntzrSource ?? false,
                     createdAt: now,
                   })
                   .returning();
@@ -440,6 +461,7 @@ export function documentService(db: Db) {
                 createdByAgentId: input.createdByAgentId ?? null,
                 createdByUserId: input.createdByUserId ?? null,
                 createdByRunId: input.createdByRunId ?? null,
+                signedUntzrSource: input.signedUntzrSource ?? false,
                 createdAt: now,
               })
               .returning();
@@ -525,6 +547,7 @@ export function documentService(db: Db) {
               createdByAgentId: input.createdByAgentId ?? null,
               createdByUserId: input.createdByUserId ?? null,
               createdByRunId: input.createdByRunId ?? null,
+              signedUntzrSource: input.signedUntzrSource ?? false,
               createdAt: now,
             })
             .returning();

@@ -14538,6 +14538,7 @@ export function issueService(db: Db) {
       createdByAgentId?: string | null;
       createdByUserId?: string | null;
       createdByRunId?: string | null;
+      signedUntzrSource?: boolean;
     }) => {
       const issue = await db
         .select({ id: issues.id, companyId: issues.companyId, createdByUserId: issues.createdByUserId, responsibleUserId: issues.responsibleUserId })
@@ -14570,6 +14571,8 @@ export function issueService(db: Db) {
                 .select({
                   id: heartbeatRuns.id,
                   status: heartbeatRuns.status,
+                  issueId: heartbeatRuns.issueId,
+                  nativeIssueId: heartbeatRuns.nativeIssueId,
                 })
                 .from(heartbeatRuns)
                 .where(
@@ -14684,6 +14687,10 @@ export function issueService(db: Db) {
             assetId: asset.id,
             issueCommentId: input.issueCommentId ?? null,
             originatingRunId: registeredRunId,
+            signedUntzrSource: Boolean(input.signedUntzrSource && input.createdByAgentId &&
+              !input.createdByUserId && registeredRun?.status === "running" &&
+              (registeredRun.issueId ?? registeredRun.nativeIssueId) === issue.id &&
+              (!registeredRun.nativeIssueId || registeredRun.nativeIssueId === issue.id)),
           })
           .returning();
         const contentPath = `/api/attachments/${attachment.id}/content`;
@@ -14804,7 +14811,7 @@ export function issueService(db: Db) {
         .where(eq(issueAttachments.issueId, issueId))
         .orderBy(desc(issueAttachments.createdAt)),
 
-    getAttachmentById: async (id: string) =>
+    getAttachmentById: async (id: string, options?: { requireSignedUntzrSource?: boolean }) =>
       db
         .select({
           id: issueAttachments.id,
@@ -14826,7 +14833,8 @@ export function issueService(db: Db) {
         })
         .from(issueAttachments)
         .innerJoin(assets, eq(issueAttachments.assetId, assets.id))
-        .where(eq(issueAttachments.id, id))
+        .where(and(eq(issueAttachments.id, id),
+          options?.requireSignedUntzrSource ? eq(issueAttachments.signedUntzrSource, true) : undefined))
         .then((rows) => rows[0] ?? null),
 
     removeAttachment: async (id: string, options?: { mcpCleanup?: McpAttachmentCleanup | null; actorAgentId?: string | null }) =>

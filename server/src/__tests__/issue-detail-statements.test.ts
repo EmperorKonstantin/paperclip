@@ -94,9 +94,9 @@ describeEmbeddedPostgres("GET /api/issues/:id statements per request", () => {
     const updated = await request(app).patch(path).send({ title: "Updated issue" }).expect(200);
     expect(updated.body).not.toHaveProperty("untzrExecution");
 
-    const nestedPayload = { result: { untzrExecution: { source: "user-provided JSON" } } };
+    const nestedPayload = { result: { ...fixture.issue, untzrExecution: { source: "user-provided JSON" } } };
     app.get(path + "/serialization-probe", (_req, res) => { res.json(nestedPayload); });
-    await request(app).get(path + "/serialization-probe").expect(200, nestedPayload);
+    await request(app).get(path + "/serialization-probe").expect(200, JSON.parse(JSON.stringify(nestedPayload)));
 
     const downstreamPath = "/api/serialization-probe";
     const downstreamPayload = { result: fixture.issue };

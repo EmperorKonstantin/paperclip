@@ -65,8 +65,9 @@ at most 1 MiB. Save an `untzr-source` issue document with a Markdown body
 containing a single JSON object with `attachmentId`, `startingCommit` (a
 40-character lowercase Git SHA), and `sha256` (the lowercase digest of the
 attachment bytes). Use the same signed run bearer for both the attachment
-upload and the document write. Retain
-the returned `latestRevisionId` as the publication receipt.
+upload and the document write. Paperclip records the authenticated write
+method for both records. Retain the returned `latestRevisionId` as the
+publication receipt.
 
 After that run succeeds, call `POST /api/private/untzr/source` with the usual
 subject and project context plus `issueId`, `runId`, `revisionId`, and the

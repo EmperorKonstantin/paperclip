@@ -273,15 +273,29 @@ describe("managed AI connections", () => {
         return baseRevisionId;
       };
       const unattributed = await writeReport(null);
-      const signedReport = await request(uploads).put(`/issues/${issue.id}/documents/untzr-source`)
-        .set("Authorization", `Bearer ${signed(run.id)}`)
-        .send({ format: "markdown", body: JSON.stringify(report), baseRevisionId })
-        .expect(200);
-      const attributed: string = signedReport.body.latestRevisionId;
-      baseRevisionId = attributed;
-      const fallbackReport = await writeReport(run.id, { ...report, attachmentId: fallback.body.id });
-      const otherRunReport = await writeReport(run.id, { ...report, attachmentId: otherUpload.body.id });
-      const wrongDigest = await writeReport(run.id, { ...report, sha256: "b".repeat(64) });
+      const writeSignedReport = async (contents = report) => {
+        const response = await request(uploads).put(`/issues/${issue.id}/documents/untzr-source`)
+          .set("Authorization", `Bearer ${signed(run.id)}`)
+          .send({ format: "markdown", body: JSON.stringify(contents), baseRevisionId })
+          .expect(200);
+        baseRevisionId = response.body.latestRevisionId;
+        return response.body.latestRevisionId as string;
+      };
+      const attributed = await writeSignedReport();
+      const alternateRevision = await writeReport(run.id, { sha256, attachmentId: attachment.id, startingCommit });
+      expect(alternateRevision).not.toBe(attributed);
+      const alternateStored = await storage.putFile({
+        companyId, namespace: `issues/${issue.id}`, originalFilename: "alternate-source.txt",
+        contentType: "text/plain", body: bytes,
+      });
+      const alternateAttachment = await issueService(db).createAttachment({
+        issueId: issue.id, ...alternateStored, createdByAgentId: approved.id, createdByRunId: run.id,
+      });
+      expect(alternateAttachment.originatingRunId).toBe(run.id);
+      const alternateAttachmentReport = await writeSignedReport({ ...report, attachmentId: alternateAttachment.id });
+      const fallbackReport = await writeSignedReport({ ...report, attachmentId: fallback.body.id });
+      const otherRunReport = await writeSignedReport({ ...report, attachmentId: otherUpload.body.id });
+      const wrongDigest = await writeSignedReport({ ...report, sha256: "b".repeat(64) });
       const integrationKey = "fixture-untzr-integration-key-123456";
       const previousIntegrationKey = process.env.PAPERCLIP_UNTZR_INTEGRATION_KEY_SHA256;
       vi.stubEnv("PAPERCLIP_UNTZR_INTEGRATION_KEY_SHA256", createHash("sha256").update(integrationKey).digest("hex"));
@@ -301,7 +315,7 @@ describe("managed AI connections", () => {
         await fetchSource({ revisionId: unattributed }).expect(403);
         await fetchSource({ startingCommit: "b".repeat(40) }).expect(409);
         await fetchSource({ issueId: randomUUID() }).expect(404);
-        for (const revisionId of [fallbackReport, otherRunReport, wrongDigest]) {
+        for (const revisionId of [alternateRevision, alternateAttachmentReport, fallbackReport, otherRunReport, wrongDigest]) {
           await fetchSource({ revisionId }).expect(403);
         }
         expect((await issueService(db).getAttachmentById(fallback.body.id))?.originatingRunId).toBeNull();

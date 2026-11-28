@@ -1,0 +1,2 @@
+ALTER TABLE "document_revisions" ADD COLUMN "signed_untzr_source" boolean DEFAULT false NOT NULL;--> statement-breakpoint
+ALTER TABLE "issue_attachments" ADD COLUMN "signed_untzr_source" boolean DEFAULT false NOT NULL;

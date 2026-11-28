@@ -242,7 +242,7 @@ export function untzrIntegrationRoutes(db: Db, storage: StorageService, options:
       agentId: source.agentId, adapter: source.adapter, config: source.config,
     });
 
-    const revision = await documentService(db).getIssueDocumentRevision(issue.id, "untzr-source", body.revisionId);
+    const revision = await documentService(db).getIssueDocumentRevision(issue.id, "untzr-source", body.revisionId, { requireSignedUntzrSource: true });
     if (!revision || revision.companyId !== scope.companyId || revision.createdByRunId !== source.runId ||
         revision.createdByAgentId !== source.agentId || revision.createdByUserId)
       throw forbidden("Untzr source requires a report from the authenticated task run");
@@ -254,7 +254,7 @@ export function untzrIntegrationRoutes(db: Db, storage: StorageService, options:
     }
     if (report.startingCommit !== body.startingCommit) throw conflict("Untzr source starting commit changed");
 
-    const attachment = await issueService(db).getAttachmentById(report.attachmentId);
+    const attachment = await issueService(db).getAttachmentById(report.attachmentId, { requireSignedUntzrSource: true });
     if (!attachment || attachment.companyId !== scope.companyId || attachment.issueId !== issue.id ||
         attachment.originatingRunId !== source.runId ||
         attachment.createdByAgentId !== source.agentId || attachment.createdByUserId !== null ||
