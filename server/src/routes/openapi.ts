@@ -4739,6 +4739,14 @@ registry.registerPath({
   },
 });
 
+const workflowStageActivationRequest = z.object({
+  assigneeAgentId: z.string().min(1),
+  status: z.literal("todo"),
+  expectedImplementation: z.object({
+    issueId: z.string().uuid(), statusVersion: z.number().int().nonnegative(), workspaceId: z.string().uuid(),
+  }).strict(),
+}).strict();
+
 registry.registerPath({
   method: "patch",
   path: "/api/issues/{id}/activate-workflow-stage",
@@ -4747,15 +4755,13 @@ registry.registerPath({
   description: "Assigns a waiting workflow stage after the completed implementation has released its workspace. Reactivation requires a board actor, the stage version, and fresh instructions.",
   request: {
     params: z.object({ id: z.string() }),
-    body: jsonBody(z.object({
-      assigneeAgentId: z.string().min(1),
-      status: z.literal("todo"),
-      expectedImplementation: z.object({
-        issueId: z.string().uuid(), statusVersion: z.number().int().nonnegative(), workspaceId: z.string().uuid(),
-      }).strict(),
-      expectedWorkflowStageVersion: z.number().int().nonnegative().optional(),
-      description: z.string().optional(),
-    }).strict()),
+    body: jsonBody(z.union([
+      workflowStageActivationRequest,
+      workflowStageActivationRequest.extend({
+        expectedWorkflowStageVersion: z.number().int().nonnegative(),
+        description: z.string(),
+      }),
+    ])),
   },
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable },
 });

@@ -1,3 +1,4 @@
+import { Ajv2020 } from "ajv/dist/2020.js";
 import express from "express";
 import fs from "node:fs";
 import path from "node:path";
@@ -1432,6 +1433,25 @@ describe("openapi routes", () => {
       extraInSpec: [],
       excludedRoutes: [...explicitOpenApiOperationCoverageExclusions].sort(),
     });
+  });
+
+  it("requires both reactivation fields together in the guarded workflow stage contract", () => {
+    const operation = loadSpecRoutes().spec.paths["/api/issues/{id}/activate-workflow-stage"].patch;
+    const schema = operation.requestBody.content["application/json"].schema;
+    const validate = new Ajv2020({ strict: false, validateFormats: false }).compile(schema);
+    const initial = {
+      assigneeAgentId: "11111111-1111-4111-8111-111111111111",
+      status: "todo",
+      expectedImplementation: {
+        issueId: "22222222-2222-4222-8222-222222222222",
+        statusVersion: 0,
+        workspaceId: "33333333-3333-4333-8333-333333333333",
+      },
+    };
+    expect(validate(initial)).toBe(true);
+    expect(validate({ ...initial, description: "Resume review", expectedWorkflowStageVersion: 0 })).toBe(true);
+    expect(validate({ ...initial, description: "Resume review" })).toBe(false);
+    expect(validate({ ...initial, expectedWorkflowStageVersion: 0 })).toBe(false);
   });
 
   it("documents agent permission grants as Board-only with a strict request", () => {
