@@ -1011,9 +1011,9 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
       responsibleUserId: run.responsibleUserId,
       agentId: agent.id,
       requireScopedCheckout,
+      expectedCheckout,
     },
   );
-  workspaceGitAuthProvider.expectedCheckout = expectedCheckout;
   if (freshNeedsSeed && issueId && !pluginPrepared && !pluginTaskWorkspace && !remoteAuthority) {
     await controllerLease.assertOwned();
     const verifySourceAccess = async () => {

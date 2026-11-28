@@ -1489,6 +1489,10 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/chats/{agentRef}/onboarding",
   "POST /api/companies/{companyId}/chats/{agentRef}/onboarding/greeting",
   "PATCH /api/agents/{id}/permission-grants",
+  "GET /api/issues/{id}/github-handoff",
+  "POST /api/issues/{id}/github-handoff",
+  "DELETE /api/issues/{id}/github-handoff/{operationId}",
+  "POST /api/heartbeat-runs/{runId}/cancel-completed-implementation",
   "GET /api/agents/{id}/runtime-state",
   "POST /api/agents/{id}/runtime-state/reset-session",
   "GET /api/agents/{id}/task-sessions",
@@ -4733,6 +4737,67 @@ registry.registerPath({
     409: r.conflict,
     422: r.unprocessable,
   },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/issues/{id}/activate-workflow-stage",
+  tags: ["issues"],
+  summary: "Activate a guarded workflow stage",
+  description: "Assigns a waiting workflow stage after the completed implementation has released its workspace. Reactivation requires a board actor, the stage version, and fresh instructions.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(z.object({
+      assigneeAgentId: z.string().min(1),
+      status: z.literal("todo"),
+      expectedImplementation: z.object({
+        issueId: z.string().uuid(), statusVersion: z.number().int().nonnegative(), workspaceId: z.string().uuid(),
+      }).strict(),
+      expectedWorkflowStageVersion: z.number().int().nonnegative().optional(),
+      description: z.string().optional(),
+    }).strict()),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/github-handoff",
+  tags: ["issues"],
+  summary: "Read the issue's GitHub handoff reservation",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/github-handoff",
+  tags: ["issues"],
+  summary: "Reserve or begin a guarded GitHub operation",
+  description: "Requires a completed issue version, assigned workspace, and commit to reserve or begin an approval or merge.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(z.object({
+      operationId: z.string().uuid(),
+      action: z.enum(["approve", "merge"]),
+      sha: z.string().regex(/^[a-f0-9]{40}$/),
+      statusVersion: z.number().int().nonnegative(),
+      projectId: z.string().uuid(),
+      workspaceId: z.string().uuid().nullable(),
+      assigneeAgentId: z.string().uuid().nullable(),
+      begin: z.boolean(),
+    }).strict()),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/issues/{id}/github-handoff/{operationId}",
+  tags: ["issues"],
+  summary: "Release the matching GitHub handoff reservation",
+  request: { params: z.object({ id: z.string(), operationId: z.string().uuid() }) },
+  responses: { 204: r.noContent, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
 });
 
 registry.registerPath({
@@ -8347,6 +8412,25 @@ registry.registerPath({
   summary: "Cancel a heartbeat run",
   request: { params: z.object({ runId: heartbeatRunIdParamSchema }) },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/heartbeat-runs/{runId}/cancel-completed-implementation",
+  tags: ["runs"],
+  summary: "Cancel a run for a completed implementation",
+  description: "Uses the current issue version and assignee guards before stopping the specified implementation run.",
+  request: {
+    params: z.object({ runId: heartbeatRunIdParamSchema }),
+    body: jsonBody(z.object({
+      cancellationRequestId: z.string().uuid(),
+      completedImplementation: z.object({
+        issueId: z.string().uuid(), statusVersion: z.number().int().nonnegative(),
+        assigneeAgentId: z.string().uuid().nullable(), runAgentId: z.string().uuid(),
+      }).strict(),
+    }).strict()),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({

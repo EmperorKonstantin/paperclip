@@ -14763,7 +14763,6 @@ export function issueRoutes(
     );
   }
 
-  const githubHandoffPath = "/issues/:id/github-handoff";
   const githubHandoffOperation = z.object({
     operationId: z.string().uuid(),
     action: z.enum(["approve", "merge"]),
@@ -14785,19 +14784,19 @@ export function issueRoutes(
     return issue;
   }
 
-  router.get(githubHandoffPath, async (req, res) => {
+  router.get("/issues/:id/github-handoff", async (req, res) => {
     const issue = await githubHandoffIssue(req, res);
     if (issue) res.json(await readIssueGithubHandoff(db, issue.id));
   });
 
-  router.post(githubHandoffPath, validate(githubHandoffOperation), async (req, res) => {
+  router.post("/issues/:id/github-handoff", validate(githubHandoffOperation), async (req, res) => {
     const issue = await githubHandoffIssue(req, res);
     if (!issue) return;
     const { begin, operationId, action, sha, ...expected } = githubHandoffOperation.parse(req.body);
     res.json(await reserveIssueGithubHandoff(db, issue.id, { operationId, action, sha }, expected, begin));
   });
 
-  router.delete(`${githubHandoffPath}/:operationId`, async (req, res) => {
+  router.delete("/issues/:id/github-handoff/:operationId", async (req, res) => {
     const issue = await githubHandoffIssue(req, res);
     if (!issue) return;
     const operationId = z.string().uuid().safeParse(req.params.operationId);

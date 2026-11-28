@@ -72,6 +72,7 @@ export type GitAuthInvocation = {
  */
 export type GitRemoteAuthProvider = ((remoteUrl: string) => Promise<GitAuthInvocation | null>) & {
   requireScopedCheckout?: boolean;
+  expectedCheckout?: { baseRef: string; sha: string };
 };
 
 /**
@@ -281,6 +282,7 @@ export function createGitRemoteAuthProvider(
     responsibleUserId?: string | null;
     agentId?: string | null;
     requireScopedCheckout?: boolean;
+    expectedCheckout?: GitRemoteAuthProvider["expectedCheckout"];
   },
   deps?: {
     secrets?: GitCredentialSecretsDeps;
@@ -291,7 +293,8 @@ export function createGitRemoteAuthProvider(
   const secrets: GitCredentialSecretsDeps = deps?.secrets ?? secretService(db);
   const env = deps?.env ?? process.env;
   const secretNames = deps?.secretNames ?? DEFAULT_GITHUB_TOKEN_SECRET_NAMES;
-  const requireScopedCheckout = context?.requireScopedCheckout === true;
+  const expectedCheckout = context?.expectedCheckout;
+  const requireScopedCheckout = context?.requireScopedCheckout === true || Boolean(expectedCheckout);
   let credentialPromise: Promise<GitCredential | null> | null = null;
 
   const resolveCredential = async (): Promise<GitCredential | null> => {
@@ -383,7 +386,7 @@ export function createGitRemoteAuthProvider(
     if (!credential) return null;
     return buildGitAuthInvocation(credential);
   };
-  return Object.assign(resolve, { requireScopedCheckout });
+  return Object.assign(resolve, { requireScopedCheckout, expectedCheckout });
 }
 
 export async function resolveManagedGitHubIdentitySelection(
