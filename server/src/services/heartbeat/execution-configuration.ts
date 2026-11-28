@@ -207,7 +207,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       commentIds: extractWakeCommentIds(context),
       actor: skillActor,
     })),
-    time("configuration_github_identity", () => resolveManagedGitHubIdentitySelection(db, agent.companyId, {
+    untzr ? Promise.resolve({ configured: false }) : time("configuration_github_identity", () => resolveManagedGitHubIdentitySelection(db, agent.companyId, {
       agentId: agent.id, responsibleUserId, allowStandingDelegation: false,
     })),
   ]);
@@ -223,9 +223,10 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
     && githubAppProjectBinding(agent.companyId, taskProjectContext.id));
   const githubSelection = {
     ...githubIdentity.value,
-    configured: githubIdentity.value.configured || githubAppConfigured,
+    configured: !untzr && (githubIdentity.value.configured || githubAppConfigured),
   };
   const useHostGitHub =
+    !untzr &&
     !githubSelection.configured &&
     trustPreset.kind === "standard" &&
     ["local", "ssh"].includes(

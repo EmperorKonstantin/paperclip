@@ -166,6 +166,7 @@ const explicitOpenApiOperationCoverageExclusions = new Set([
   "POST /api/private/untzr/codex/complete",
   "POST /api/private/untzr/codex/cancel",
   "POST /api/private/untzr/launch",
+  "POST /api/private/untzr/source",
   // OAuth discovery and protocol endpoints have their own metadata contract;
   // browser connection-management operations remain documented in the board API.
   // Markdown rendering of the separately documented assistant setup page.
@@ -1397,7 +1398,7 @@ describe("openapi routes", () => {
     const operations = [...explicitOpenApiOperationCoverageExclusions].filter(route => route.startsWith(prefix));
     const { excludedRoutes } = loadActualRoutes();
     const { routes: specRoutes } = loadSpecRoutes();
-    expect(operations).toHaveLength(8);
+    expect(operations).toHaveLength(9);
     expect([...excludedRoutes].filter(route => route.startsWith(prefix)).sort()).toEqual(operations.sort());
     expect([...specRoutes].filter(route => route.startsWith(prefix))).toEqual([]);
   });

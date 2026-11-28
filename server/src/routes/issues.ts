@@ -11686,6 +11686,17 @@ export function issueRoutes(
         return;
       }
 
+      if (issue.untzrExecution && keyParsed.data === "untzr-source") {
+        const { actor } = req;
+        const run = actor.type === "agent" && actor.source === "agent_jwt" && actor.runId
+          ? await heartbeat.getRun(actor.runId) : null;
+        if (!run || actor.type !== "agent" || run.companyId !== issue.companyId || run.agentId !== actor.agentId ||
+            run.status !== "running" || (run.issueId ?? run.nativeIssueId) !== issue.id ||
+            (run.nativeIssueId && run.nativeIssueId !== issue.id)) {
+          throw forbidden("Untzr source reports require the authenticated active task run");
+        }
+      }
+
       const actor = getActorInfo(req);
       const sourceTrust = await sourceTrustForActorWrite(issue, actor);
       const referenceSummaryBefore =

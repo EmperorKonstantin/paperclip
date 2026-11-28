@@ -11,8 +11,8 @@ Each entry has `subject`, `userId`, `companyId`, `projectId`, `workspaceId`,
 (the configured source ref), and `agentIds`. A subject maps to one Paperclip
 user per company. The user must have an active membership and access to the
 private project. Match the workspace, repository ID, and agents in
-`PAPERCLIP_GITHUB_APP_PROJECTS`. Configure the existing GitHub App checkout
-and active-run broker for these repositories.
+`PAPERCLIP_GITHUB_APP_PROJECTS`. Configure the GitHub App broker to issue repository-scoped read-only checkout
+credentials for these repositories.
 
 ## Profile Settings
 
@@ -53,10 +53,29 @@ with the matching Codex or Claude harness for every approved stage. A task
 and its follow-ups retain the original user, grant, project, workspace,
 repository, and source ref.
 
-The GitHub broker provides repository-scoped installation credentials.
-GitHub repository rules must enforce permitted write branches because an
-installation token authorizes repository permissions. Verify those rules
-with the pilot fixtures before enabling customer dispatch. Record opaque
-connection references, task and run IDs, repository and ref, and the output
-branch or PR for acceptance. Keep credentials and sign-in codes out of that
-evidence.
+## Source publication
+
+Untzr-bound runs use the approved read-only checkout. The trusted Untzr
+publisher holds the write credentials and derives the destination from its
+persisted assignment.
+
+During the source run, upload the source changes as an issue attachment of
+at most 1 MiB. Save an `untzr-source` issue document with a Markdown body
+containing a single JSON object with `attachmentId`, `startingCommit` (a
+40-character lowercase Git SHA), and `sha256` (the lowercase digest of the
+attachment bytes). Use the signed run bearer for the document write. Retain
+the returned `latestRevisionId` as the publication receipt.
+
+After that run succeeds, call `POST /api/private/untzr/source` with the usual
+subject and project context plus `issueId`, `runId`, `revisionId`, and the
+expected `startingCommit` from Untzr's trusted assignment. Paperclip checks the
+live user, grant, agent and repository scope, the revision's authenticated
+run attribution, and the attachment's issue, size and SHA-256. The response
+contains those receipt identifiers, the repository identity, the report, and
+`sourceBase64`. The publisher checks the returned identity against its approved
+assignment, verifies the decoded bytes and expected starting head, and
+publishes only to its approved task ref with an expected-head guard.
+
+Record opaque connection references, task and run IDs, repository and ref,
+and the output branch or PR for acceptance. Keep credentials and sign-in
+codes out of that evidence.

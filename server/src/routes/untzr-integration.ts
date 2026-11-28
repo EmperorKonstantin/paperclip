@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
-import { adapterAuthSessions, agents, connectionGrants, toolConnections, type Db } from "@paperclipai/db";
+import { adapterAuthSessions, agents, connectionGrants, heartbeatRuns, issues, toolConnections, type Db } from "@paperclipai/db";
 import { agentHarnessType, aiConnectionMetadataSchema, createAiConnectionSchema } from "@paperclipai/shared";
 import { conflict, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 import { validate } from "../middleware/validate.js";
@@ -10,6 +10,8 @@ import { logActivity } from "../services/activity-log.js";
 import { validateAiApiKey } from "../services/ai-api-key-test.js";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { documentService } from "../services/documents.js";
+import type { StorageService } from "../storage/types.js";
 import { issueService } from "../services/issues.js";
 import { localAiLoginService } from "../services/local-ai-login.js";
 import { supportsLocalAiLogin } from "../services/local-ai-login-policy.js";
@@ -27,7 +29,18 @@ const launch = context.extend({
   title: z.string().trim().min(1).max(240), description: z.string().max(100_000).optional(),
 });
 
-export function untzrIntegrationRoutes(db: Db, options: Parameters<typeof supportsLocalAiLogin>[0]) {
+const sourceRequest = context.extend({
+  issueId: uuid, runId: uuid, revisionId: uuid,
+  startingCommit: z.string().regex(/^[a-f0-9]{40}$/),
+});
+const sourceReport = z.object({
+  attachmentId: uuid,
+  startingCommit: sourceRequest.shape.startingCommit,
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict();
+const maxSourceBytes = 1024 * 1024;
+
+export function untzrIntegrationRoutes(db: Db, storage: StorageService, options: Parameters<typeof supportsLocalAiLogin>[0]) {
   const router = Router();
   const heartbeat = heartbeatService(db);
   const service = aiConnectionService(db);
@@ -199,6 +212,70 @@ export function untzrIntegrationRoutes(db: Db, options: Parameters<typeof suppor
       payload: { issueId: issue.id }, contextSnapshot: { issueId: issue.id }, idempotencyKey: handoffId,
       requestedByActorType: "user", requestedByActorId: scope.userId });
     res.status(202).json({ issueId: issue.id, identifier: issue.identifier });
+  });
+  router.post("/source", validate(sourceRequest), async (req, res) => {
+    const body = sourceRequest.parse(req.body);
+    const scope = await resolveScope(body);
+    const [issue] = await db.select({
+      id: issues.id, projectId: issues.projectId, projectWorkspaceId: issues.projectWorkspaceId,
+      status: issues.status, untzrExecution: issues.untzrExecution,
+    }).from(issues).where(and(eq(issues.companyId, scope.companyId), eq(issues.projectId, scope.projectId),
+      eq(issues.id, body.issueId)));
+    if (!issue ||
+        issue.status === "cancelled" || !issue.untzrExecution) throw notFound("Untzr source issue not found");
+    const execution = untzrExecutionSchema.parse(issue.untzrExecution);
+    if (execution.subject !== scope.subject || execution.userId !== scope.userId)
+      throw forbidden("Untzr source belongs to another user");
+
+    const [source] = await db.select({
+      runId: heartbeatRuns.id, issueId: heartbeatRuns.issueId, nativeIssueId: heartbeatRuns.nativeIssueId,
+      agentId: agents.id, adapter: agents.adapterType, config: agents.adapterConfig,
+    }).from(heartbeatRuns)
+      .innerJoin(agents, and(eq(agents.companyId, scope.companyId), eq(agents.id, heartbeatRuns.agentId)))
+      .where(and(eq(heartbeatRuns.companyId, scope.companyId), eq(heartbeatRuns.id, body.runId),
+        eq(heartbeatRuns.status, "succeeded"), eq(heartbeatRuns.responsibleUserId, scope.userId)));
+    if (!source || (source.issueId ?? source.nativeIssueId) !== issue.id ||
+        (source.issueId && source.nativeIssueId && source.nativeIssueId !== issue.id))
+      throw forbidden("Untzr source requires the successful task run");
+    await assertUntzrExecution(db, execution, {
+      companyId: scope.companyId, projectId: issue.projectId, workspaceId: issue.projectWorkspaceId,
+      agentId: source.agentId, adapter: source.adapter, config: source.config,
+    });
+
+    const revision = await documentService(db).getIssueDocumentRevision(issue.id, "untzr-source", body.revisionId);
+    if (!revision || revision.companyId !== scope.companyId || revision.createdByRunId !== source.runId ||
+        revision.createdByAgentId !== source.agentId || revision.createdByUserId)
+      throw forbidden("Untzr source requires a report from the authenticated task run");
+    let report: z.infer<typeof sourceReport>;
+    try {
+      report = sourceReport.parse(JSON.parse(revision.body));
+    } catch {
+      throw unprocessable("Invalid Untzr source report");
+    }
+    if (report.startingCommit !== body.startingCommit) throw conflict("Untzr source starting commit changed");
+
+    const attachment = await issueService(db).getAttachmentById(report.attachmentId);
+    if (!attachment || attachment.companyId !== scope.companyId || attachment.issueId !== issue.id ||
+        (attachment.originatingRunId && attachment.originatingRunId !== source.runId) ||
+        attachment.sha256 !== report.sha256 || attachment.byteSize < 1 || attachment.byteSize > maxSourceBytes)
+      throw forbidden("Untzr source attachment does not match the bounded report");
+
+    const signal = AbortSignal.timeout(10_000);
+    const { stream } = await storage.getObject(scope.companyId, attachment.objectKey, { signal });
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of stream) {
+      const bytes = Buffer.from(chunk);
+      size += bytes.length;
+      if (size > attachment.byteSize) throw conflict("Untzr source attachment size changed");
+      chunks.push(bytes);
+    }
+    const bytes = Buffer.concat(chunks, size);
+    if (size !== attachment.byteSize || createHash("sha256").update(bytes).digest("hex") !== report.sha256)
+      throw conflict("Untzr source attachment integrity check failed");
+    res.json({ issueId: issue.id, runId: source.runId, revisionId: revision.id,
+      repositoryId: execution.repositoryId, repository: execution.repository,
+      ...report, sourceBase64: bytes.toString("base64") });
   });
   return router;
 }

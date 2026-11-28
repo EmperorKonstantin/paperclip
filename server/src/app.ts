@@ -665,7 +665,7 @@ export async function createApp(
   // board/agent bearer authentication. Mount before actorMiddleware so its
   // per-session Bearer cannot be mistaken for an agent API key.
   app.use(voiceWebhookRoutes(db, chatChannels.voice));
-  app.use("/api/private/untzr", untzrIntegrationRoutes(db, { deploymentMode: opts.deploymentMode,
+  app.use("/api/private/untzr", untzrIntegrationRoutes(db, opts.storageService, { deploymentMode: opts.deploymentMode,
     deploymentExposure: opts.deploymentExposure }));
   app.use(
     actorMiddleware(db, {

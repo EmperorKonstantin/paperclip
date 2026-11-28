@@ -24,6 +24,8 @@ import { assertTaskWorkspaceExecutionAccess } from "./task-workspace-access.js";
 import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
 import { isLowTrustQuarantined } from "./source-trust.js";
 
+import { assertUntzrGitHubWriteAllowed } from "./untzr-execution.js";
+
 export type GitHubCredentialSummary = {
   status: "available" | "absent" | "unavailable";
   source?: "personal" | "dedicated";
@@ -134,6 +136,7 @@ export async function resolveGitHubOperationCredentials(
     runId: string;
   },
 ) {
+  await assertUntzrGitHubWriteAllowed(db, input.companyId, input);
   const { run, context } = await captureRunIdentity(db, input, { readScope: "github_credentials" });
   if (!context) throw forbidden("This run predates managed GitHub credentials");
   return resolveCapturedGitHubCredentials(db, run, context);
@@ -143,6 +146,7 @@ export async function resolveGitHubCompletionCredentials(
   db: Db,
   input: { companyId: string; issueId: string; runId: string },
 ) {
+  await assertUntzrGitHubWriteAllowed(db, input.companyId, input);
   const [source] = await db.select({ agentId: heartbeatRuns.agentId })
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
     eq(heartbeatRuns.nativeIssueId, input.issueId))).limit(1);
@@ -248,22 +252,11 @@ async function resolveGitHubAppRunToken(db: Db, run: GitHubCredentialRun, contex
   const issueId = run.issueId ?? run.nativeIssueId ?? run.contextSnapshot?.issueId ?? run.contextSnapshot?.taskId;
   if (typeof issueId !== "string" || !isUuidLike(issueId)) return undefined;
   const [issue] = await db.select({ projectId: issues.projectId, assigneeAgentId: issues.assigneeAgentId,
-    executionWorkspaceId: issues.executionWorkspaceId, untzrExecution: issues.untzrExecution,
+    executionWorkspaceId: issues.executionWorkspaceId,
     projectWorkspaceId: issues.projectWorkspaceId }).from(issues)
     .where(and(eq(issues.companyId, input.companyId), eq(issues.id, issueId)));
-  if (issue?.untzrExecution) {
-    const { assertUntzrExecution, untzrExecutionSchema } = await import("./untzr-execution.js");
-    const execution = untzrExecutionSchema.parse(issue.untzrExecution);
-    const [agent] = await db.select({ adapter: agents.adapterType, config: agents.adapterConfig }).from(agents)
-      .where(and(eq(agents.companyId, companyId), eq(agents.id, agentId)));
-    if (!agent || run.responsibleUserId !== execution.userId)
-      throw forbidden("The GitHub operation is outside the approved Untzr run");
-    await assertUntzrExecution(db, execution, { companyId, agentId, projectId: issue.projectId,
-      workspaceId: issue.projectWorkspaceId, ...agent });
-  }
   if (!issue?.projectId) return undefined;
   const binding = githubAppProjectBinding(input.companyId, issue.projectId);
-  if (!binding && issue.untzrExecution) throw forbidden("The Untzr GitHub binding is unavailable");
   if (!binding) return undefined;
   const [project] = await db.select({ visibility: projects.visibility, archivedAt: projects.archivedAt }).from(projects)
     .where(and(eq(projects.companyId, input.companyId), eq(projects.id, binding.projectId)));

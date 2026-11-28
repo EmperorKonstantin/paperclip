@@ -1,3 +1,11 @@
+import { Readable } from "node:stream";
+import { untzrIntegrationRoutes } from "../routes/untzr-integration.js";
+import { errorHandler } from "../middleware/error-handler.js";
+import { issueService } from "../services/issues.js";
+import { documentService } from "../services/documents.js";
+import type { StorageService } from "../storage/types.js";
+import { createGitRemoteAuthProvider } from "../services/git-credentials.js";
+import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
 import { githubAppTaskCheckout } from "../services/github-app-credentials.js";
 import * as checkoutBroker from "../services/github-checkout-broker.js";
 import { completeSetupTokenAiConnection } from "../services/setup-token-ai-connection.js";
@@ -171,7 +179,70 @@ describe("managed AI connections", () => {
       await db.update(issues).set({ assigneeAgentId: approved.id }).where(eq(issues.id, issue.id));
       await expect(checkout(approved.id)).resolves.toBe("fixture-installation-token");
       expect(broker).toHaveBeenCalledOnce();
+      expect(broker).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ operation: "checkout" }));
       broker.mockClear();
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId, agentId: approved.id, issueId: issue.id, scopeKind: "issue",
+        status: "running", responsibleUserId: userId,
+      }).returning();
+      const runBinding = { companyId, agentId: approved.id, runId: run.id };
+      await expect(resolveGitHubOperationCredentials(db, runBinding)).rejects.toThrow("Untzr publisher");
+      const lookup = createGitRemoteAuthProvider(db, companyId, {
+        heartbeatRunId: run.id, agentId: approved.id,
+      }, { env: { GH_TOKEN: "fixture-forbidden-fallback" } });
+      await expect(lookup(repoUrl)).rejects.toThrow("Untzr publisher");
+      expect(broker).not.toHaveBeenCalled();
+      const checkoutLookup = createGitRemoteAuthProvider(db, companyId, {
+        issueId: issue.id, heartbeatRunId: run.id, agentId: approved.id,
+      });
+      await expect(checkoutLookup("https://github.com/example/other.git")).rejects.toThrow("approved Untzr repository");
+      expect(broker).not.toHaveBeenCalled();
+      await expect(checkoutLookup(repoUrl)).resolves.toMatchObject({ source: "managed_connection" });
+      expect(broker).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ operation: "checkout" }));
+      broker.mockClear();
+      const bytes = Buffer.from("fixture source changes");
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      const attachment = await issueService(db).createAttachment({
+        issueId: issue.id, provider: "local_disk", objectKey: "fixture-publisher-source",
+        contentType: "text/plain", byteSize: bytes.length, sha256,
+        originalFilename: "source.txt", createdByAgentId: approved.id, createdByUserId: null,
+      });
+      expect(attachment.originatingRunId).toBeNull();
+      const startingCommit = "a".repeat(40);
+      const report = { attachmentId: attachment.id, startingCommit, sha256 };
+      const documents = documentService(db);
+      const writeReport = (runId: string | null, baseRevisionId: string | null = null) => documents.upsertIssueDocument({
+        issueId: issue.id, key: "untzr-source", format: "markdown", body: JSON.stringify(report),
+        createdByAgentId: approved.id, createdByRunId: runId, baseRevisionId,
+      });
+      const unattributed = await writeReport(null);
+      const attributed = await writeReport(run.id, unattributed.document.latestRevisionId);
+      const integrationKey = "fixture-untzr-integration-key-123456";
+      const previousIntegrationKey = process.env.PAPERCLIP_UNTZR_INTEGRATION_KEY_SHA256;
+      vi.stubEnv("PAPERCLIP_UNTZR_INTEGRATION_KEY_SHA256", createHash("sha256").update(integrationKey).digest("hex"));
+      const getObject = vi.fn(async () => ({ stream: Readable.from([bytes]), contentType: "text/plain" }));
+      const app = express();
+      app.use(express.json());
+      app.use(untzrIntegrationRoutes(db, { getObject } as unknown as StorageService, { deploymentMode: "local_trusted" }));
+      app.use(errorHandler);
+      const fetchSource = (overrides = {}) => request(app).post("/source")
+        .set("Authorization", `Bearer ${integrationKey}`)
+        .send({ subject: userId, companyId, projectId: project.id, issueId: issue.id,
+          runId: run.id, revisionId: attributed.document.latestRevisionId, startingCommit, ...overrides });
+      try {
+        await fetchSource().expect(403);
+        await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, run.id));
+        await fetchSource({ revisionId: unattributed.document.latestRevisionId }).expect(403);
+        await fetchSource({ startingCommit: "b".repeat(40) }).expect(409);
+        await fetchSource({ issueId: randomUUID() }).expect(404);
+        expect(getObject).not.toHaveBeenCalled();
+        const response = await fetchSource().expect(200);
+        expect(response.body).toMatchObject({ ...report, runId: run.id, issueId: issue.id, sourceBase64: bytes.toString("base64") });
+        getObject.mockResolvedValueOnce({ stream: Readable.from([Buffer.alloc(bytes.length)]), contentType: "text/plain" });
+        await fetchSource().expect(409);
+      } finally {
+        vi.stubEnv("PAPERCLIP_UNTZR_INTEGRATION_KEY_SHA256", previousIntegrationKey);
+      }
       await db.update(issues).set({ projectWorkspaceId: null }).where(eq(issues.id, issue.id));
       await expect(checkout(approved.id)).rejects.toThrow("approved Untzr project and repository");
       await db.update(issues).set({ projectWorkspaceId: workspace.id }).where(eq(issues.id, issue.id));

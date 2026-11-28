@@ -31,6 +31,10 @@ export function githubAppProjectBinding(companyId: string, projectId: string, en
 }
 
 export async function scopedGitHubAppCredential(db: Db, input: GitHubInstallationScope, env = process.env) {
+  if (input.operation === "write") {
+    const { assertUntzrGitHubWriteAllowed } = await import("./untzr-execution.js");
+    await assertUntzrGitHubWriteAllowed(db, input.companyId, input);
+  }
   const binding = githubAppProjectBinding(input.companyId, input.projectId, env);
   if (!binding) return undefined;
   if (input.workspaceId !== binding.workspaceId || input.repositoryId !== binding.repositoryId

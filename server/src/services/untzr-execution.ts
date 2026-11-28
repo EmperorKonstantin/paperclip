@@ -1,7 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import { authUsers, companyMemberships, issues, projects, projectWorkspaces, type Db } from "@paperclipai/db";
-import { agentHarnessType, type AiConnectionBinding } from "@paperclipai/shared";
-import { and, eq, inArray } from "drizzle-orm";
+import { authUsers, companyMemberships, heartbeatRuns, issues, projects, projectWorkspaces, type Db } from "@paperclipai/db";
+import { agentHarnessType, isUuidLike, type AiConnectionBinding } from "@paperclipai/shared";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import { forbidden } from "../errors.js";
 import { aiConnectionService } from "./ai-connections.js";
@@ -119,4 +119,40 @@ export async function readUntzrIssueExecution(db: Db, companyId: string, issueId
     .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
   if (!issue?.execution) return null;
   return { ...issue, execution: untzrExecutionSchema.parse(issue.execution) };
+}
+
+export const untzrGitHubWriteDenied = "GitHub write credentials are reserved for the trusted Untzr publisher";
+
+export async function assertUntzrGitHubWriteAllowed(db: Db, companyId: string, binding: {
+  issueId?: string | null;
+  runId?: string | null;
+  agentId?: string | null;
+}, options: { allowCheckoutForIssue?: boolean } = {}) {
+  const candidates: unknown[] = [binding.issueId];
+  let checkoutUserId: string | null = null;
+  if (binding.runId) {
+    const [run] = await db.select({
+      issueId: heartbeatRuns.issueId, nativeIssueId: heartbeatRuns.nativeIssueId,
+      contextIssueId: sql<string | null>`${heartbeatRuns.contextSnapshot}->>'issueId'`,
+      contextTaskId: sql<string | null>`${heartbeatRuns.contextSnapshot}->>'taskId'`,
+      agentId: heartbeatRuns.agentId, responsibleUserId: heartbeatRuns.responsibleUserId,
+    }).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, binding.runId)));
+    if (!run || (binding.agentId && run.agentId !== binding.agentId)) {
+      throw forbidden("GitHub credentials require a matching run");
+    }
+    const runIssues = [run.issueId, run.nativeIssueId, run.contextIssueId, run.contextTaskId];
+    const primaryIssueId = runIssues.find(id => id != null);
+    if (options.allowCheckoutForIssue && binding.issueId && primaryIssueId === binding.issueId &&
+        runIssues.every(id => id == null || id === binding.issueId)) checkoutUserId = run.responsibleUserId;
+    candidates.push(...runIssues);
+  }
+  const issueIds = [...new Set(candidates.filter((id): id is string => typeof id === "string" && isUuidLike(id)))];
+  if (!issueIds.length) return;
+  const rows = await db.select({ execution: issues.untzrExecution }).from(issues)
+    .where(and(eq(issues.companyId, companyId), inArray(issues.id, issueIds)));
+  for (const { execution } of rows) {
+    if (execution && (!checkoutUserId || untzrExecutionSchema.parse(execution).userId !== checkoutUserId)) {
+      throw forbidden(untzrGitHubWriteDenied);
+    }
+  }
 }

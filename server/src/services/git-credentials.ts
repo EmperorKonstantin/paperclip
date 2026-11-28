@@ -328,6 +328,12 @@ export function createGitRemoteAuthProvider(
 
   return async (remoteUrl: string) => {
     if (!isSupportedGitHubRemoteUrl(remoteUrl)) return null;
+    if (db && context?.heartbeatRunId) {
+      const { assertUntzrGitHubWriteAllowed } = await import("./untzr-execution.js");
+      await assertUntzrGitHubWriteAllowed(db, companyId, {
+        issueId: context.issueId, runId: context.heartbeatRunId, agentId: context.agentId,
+      }, { allowCheckoutForIssue: true });
+    }
     if (db && context?.issueId) {
       const token = await githubAppTaskCheckout(db, companyId, context.issueId, context.agentId, remoteUrl, env);
       if (token) return buildGitAuthInvocation({ token, source: "managed_connection", secretName: null });
@@ -547,6 +553,12 @@ export async function resolveManagedGitHubCredential(
     explicitGrantId?: string;
   },
 ): Promise<{ configured: boolean; identitySource?: "personal" | "dedicated"; credential?: GitCredential; error?: string }> {
+  if (context.issueId || context.heartbeatRunId) {
+    const { assertUntzrGitHubWriteAllowed } = await import("./untzr-execution.js");
+    await assertUntzrGitHubWriteAllowed(db, companyId, {
+      issueId: context.issueId, runId: context.heartbeatRunId, agentId: context.agentId,
+    });
+  }
   const selection = await resolveManagedGitHubIdentitySelection(db, companyId, context);
   if (!selection.configured) return { configured: false };
   if (!selection.grant) return { configured: true, identitySource: selection.identitySource, error: selection.error };
