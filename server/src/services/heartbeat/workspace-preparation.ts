@@ -52,6 +52,7 @@ import { createHostDuplexObservabilityRecorder } from "../duplex-observability-r
 import { incrementToolRuntimeMetricCounter } from "../tool-runtime-metrics.js";
 import { logger } from "../../middleware/logger.js";
 import { createGitRemoteAuthProvider } from "../git-credentials.js";
+import { readUntzrIssueExecution } from "../untzr-execution.js";
 import { readNativeWorkspaceSyncReference, readNativeWorkspaceSyncLocalCwd } from "../native-runtime/index.js";
 import { parseObject } from "../../adapters/utils.js";
 import { materializeNativeChatTaskRoot } from "../native-runtime/native-chat-workspace.js";
@@ -983,6 +984,7 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
   });
   // The run-scoped provider resolves the active identity at each Git operation,
   // including base-ref refreshes, workspace realization, and restore.
+  const requireScopedCheckout = issueId ? Boolean(await readUntzrIssueExecution(db, agent.companyId, issueId)) : false;
   const workspaceGitAuthProvider = createGitRemoteAuthProvider(
     db,
     agent.companyId,
@@ -991,6 +993,7 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
       heartbeatRunId: run.id,
       responsibleUserId: run.responsibleUserId,
       agentId: agent.id,
+      requireScopedCheckout,
     },
   );
   if (freshNeedsSeed && issueId && !pluginPrepared && !pluginTaskWorkspace && !remoteAuthority) {

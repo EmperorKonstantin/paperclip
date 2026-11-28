@@ -17562,7 +17562,7 @@ export function issueRoutes(
           );
       }
 
-      res.json(publicIssue(updated));
+      res.json(updated == null ? updated : publicIssue(updated));
     },
   );
 

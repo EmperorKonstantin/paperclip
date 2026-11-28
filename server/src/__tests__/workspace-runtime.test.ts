@@ -667,6 +667,42 @@ describe("refreshRemoteTrackingBaseRef git auth", () => {
     expect(offeredUrls).toEqual([remotePath]);
   });
 
+  it.each(["denied", "unavailable"] as const)(
+    "withholds ambient fetches during scoped worktree creation and restore when checkout is %s",
+    async (availability) => {
+      const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+      await runGit(repoRoot, ["config", "user.name", "Synthetic host identity"]);
+      const before = await readGit(repoRoot, ["rev-parse", "origin/master"]);
+      const after = await advanceRemoteMaster(sourceRepo, remotePath, "scoped-first.txt");
+      const denied = Object.assign(async () => {
+        if (availability === "denied") throw new Error("Scoped checkout denied");
+        return null;
+      }, { requireScopedCheckout: true });
+      const approved = Object.assign(async () => ({
+        configArgs: [], env: { GIT_TERMINAL_PROMPT: "0" }, source: "managed_connection",
+      }), { requireScopedCheckout: true });
+      await expect(realizeWorktreeForTest(repoRoot, "origin/master", denied)).rejects.toThrow(/scoped.*checkout/i);
+      expect(await readGit(repoRoot, ["rev-parse", "origin/master"])).toBe(before);
+
+      const fresh = await realizeWorktreeForTest(repoRoot, "origin/master", approved);
+      expect(await readGit(repoRoot, ["rev-parse", "origin/master"])).toBe(after);
+      await advanceRemoteMaster(sourceRepo, remotePath, "scoped-second.txt");
+      await expect(ensurePersistedExecutionWorkspaceAvailable({
+        resolveGitAuth: denied,
+        base: fresh,
+        workspace: {
+          id: "workspace-1", mode: "isolated_workspace", strategyType: "git_worktree",
+          cwd: fresh.cwd, providerRef: fresh.cwd, projectId: "project-1", projectWorkspaceId: "workspace-1",
+          repoUrl: null, baseRef: "origin/master", branchName: fresh.branchName,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        },
+        issue: { id: "issue-1", identifier: "PAP-447", title: "Add Worktree Support" },
+        agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+      })).rejects.toThrow(/scoped.*checkout/i);
+      expect(await readGit(repoRoot, ["rev-parse", "origin/master"])).toBe(after);
+    },
+  );
+
   it("attributes a failed authenticated fetch to the credential that was used", async () => {
     const { repoRoot } = await createClonedRepoWithRemote();
     await runGit(repoRoot, ["remote", "set-url", "origin", path.join(os.tmpdir(), "paperclip-missing-remote", "repo.git")]);

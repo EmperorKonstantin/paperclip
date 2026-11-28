@@ -169,7 +169,9 @@ export type GitRemoteAuthInvocation = {
   secretName?: string | null;
 };
 
-export type GitRemoteAuthProvider = (remoteUrl: string) => Promise<GitRemoteAuthInvocation | null>;
+export type GitRemoteAuthProvider = ((remoteUrl: string) => Promise<GitRemoteAuthInvocation | null>) & {
+  requireScopedCheckout?: boolean;
+};
 
 export interface ExecutionWorkspaceIssueRef {
   id: string;
@@ -1050,12 +1052,18 @@ async function refreshRemoteTrackingBaseRefWithDiagnostic(
       return value.trim() || null;
     })
     .catch(() => { diagnostic.remoteLookup = "failed"; return null; });
-  if (!remoteUrl) return { warnings: [], diagnostic };
+  if (!remoteUrl) {
+    if (resolveGitAuth?.requireScopedCheckout) throw new Error("Scoped Git checkout requires a configured repository remote.");
+    return { warnings: [], diagnostic };
+  }
 
   const auth = resolveGitAuth ? await resolveGitAuth(remoteUrl).then((value) => {
     diagnostic.authLookup = value ? "resolved" : "unavailable";
     return value;
   }).catch(() => { diagnostic.authLookup = "failed"; return null; }) : null;
+  if (resolveGitAuth?.requireScopedCheckout && !auth) {
+    throw new Error("Scoped Git checkout authorization is unavailable.");
+  }
   try {
     await runGit([
       ...(auth?.configArgs ?? []),
@@ -2814,6 +2822,7 @@ async function readAdvertisedDefaultBranch(repoRoot: string, resolveGitAuth?: Gi
   try {
     const remoteUrl = await runGit(["remote", "get-url", "origin"], repoRoot);
     const auth = resolveGitAuth ? await resolveGitAuth(remoteUrl) : null;
+    if (resolveGitAuth?.requireScopedCheckout && !auth) return null;
     const output = await new Promise<string>((resolve, reject) => {
       execFile("git", [...(auth?.configArgs ?? []), "ls-remote", "--symref", "origin", "HEAD"], {
         cwd: repoRoot, timeout: 10_000, maxBuffer: 64 * 1024,
@@ -4044,6 +4053,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     await restoreGitWorkspaceContents({ cwd, companyId: input.agent.companyId, workspaceId: input.workspace.id,
       projectId: input.workspace.projectId, contents: restoration.contents, resolveGitAuth: async url => {
         const auth = await input.resolveGitAuth?.(url);
+        if (!auth && input.resolveGitAuth?.requireScopedCheckout) throw new GitCacheRestorationFailure();
         if (!auth) return null;
         const source = auth.source;
         if (source !== "company_secret" && source !== "managed_connection" && source !== "server_env") throw new GitCacheRestorationFailure();

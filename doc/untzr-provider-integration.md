@@ -55,10 +55,10 @@ repository, and source ref.
 
 ## Source publication
 
-Untzr-bound runs use the approved read-only checkout, including foreground
-workspace preparation by a project provider. The trusted Untzr
-publisher holds the write credentials and derives the destination from its
-persisted assignment.
+Untzr-bound runs use the approved read-only checkout during foreground
+workspace preparation and worktree refresh. A scoped checkout refusal stops
+the fetch. The trusted Untzr publisher holds the write credentials and
+derives the destination from its persisted assignment.
 
 During the source run, upload the source changes as an issue attachment of
 at most 1 MiB. Save an `untzr-source` issue document with a Markdown body

@@ -198,9 +198,14 @@ describe("managed AI connections", () => {
       }, { env: { GH_TOKEN: "fixture-forbidden-fallback" } });
       await expect(lookup(repoUrl)).rejects.toThrow("Untzr publisher");
       expect(broker).not.toHaveBeenCalled();
+      const checkoutContext = { issueId: issue.id, heartbeatRunId: run.id, agentId: approved.id };
       const checkoutLookup = createGitRemoteAuthProvider(db, companyId, {
-        issueId: issue.id, heartbeatRunId: run.id, agentId: approved.id,
+        ...checkoutContext, requireScopedCheckout: true,
       });
+      expect(checkoutLookup.requireScopedCheckout).toBe(true);
+      await expect(checkoutLookup("https://example.test/unsupported.git")).rejects.toThrow("Scoped Git checkout");
+      const baseCheckoutLookup = createGitRemoteAuthProvider(db, companyId, checkoutContext);
+      await expect(baseCheckoutLookup("https://example.test/unsupported.git")).rejects.toThrow("Scoped Git checkout");
       await expect(checkoutLookup("https://github.com/example/other.git")).rejects.toThrow("approved Untzr repository");
       expect(broker).not.toHaveBeenCalled();
       await expect(checkoutLookup(repoUrl)).resolves.toMatchObject({ source: "managed_connection" });
