@@ -1,3 +1,4 @@
+import { materializeFreshWorkspaceSeed } from "../services/fresh-workspace-seed.js";
 import { execFile, spawn } from "node:child_process";
 import { setupCommandFailureResultJson } from "../services/workspace-setup-command-failure.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -9,7 +10,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -636,6 +637,35 @@ describe("resolveRuntimeProvisionCommand", () => {
       expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
     } finally {
       await fs.rm(baseCwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("scoped fresh workspace seed", () => {
+  it("copies the approved commit reachable only from the cache's tracking ref", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-scoped-fresh-home-"));
+    const previousHome = process.env.PAPERCLIP_HOME;
+    vi.stubEnv("PAPERCLIP_HOME", home);
+    try {
+      const branch = "untzr/0123456789abcdef";
+      const baseRef = `refs/remotes/origin/${branch}`;
+      const commit = await advanceRemoteMaster(sourceRepo, remotePath, "only-on-approved-branch.txt");
+      await runGit(sourceRepo, ["push", remotePath, `HEAD:refs/heads/${branch}`]);
+      await runGit(repoRoot, ["fetch", "--no-tags", "--no-recurse-submodules", remotePath, `+refs/heads/${branch}:${baseRef}`]);
+      expect(await readGit(repoRoot, ["for-each-ref", "--contains", commit, "--format=%(refname)"])).toBe(baseRef);
+
+      const cwd = await materializeFreshWorkspaceSeed({
+        companyId: randomUUID(), issueId: randomUUID(), runId: randomUUID(), sourceCwd: repoRoot,
+        baseRef, expectedCommit: commit, repoUrl: remotePath,
+      });
+      expect(await readGit(cwd, ["rev-parse", "HEAD"])).toBe(commit);
+      expect(await readGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe("HEAD");
+      expect(await readGit(cwd, ["remote", "get-url", "origin"])).toBe(remotePath);
+      await expect(fs.stat(path.join(cwd, ".git", "objects", "info", "alternates"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      vi.stubEnv("PAPERCLIP_HOME", previousHome);
+      await fs.rm(home, { recursive: true, force: true });
     }
   });
 });

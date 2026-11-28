@@ -87,6 +87,7 @@ export function parsePorcelainZ(status: string) {
  * The caller authorizes the source before calling this function. */
 export async function materializeFreshWorkspaceSeed(input: {
   companyId: string; issueId: string; runId: string; sourceCwd: string; baseRef?: string | null; repoUrl?: string | null;
+  expectedCommit?: string;
   beforeCopy?(sourceCwd: string, targetCwd: string): Promise<void>;
 }) {
   const root = await materializeIsolatedTaskDirectory({
@@ -104,7 +105,8 @@ export async function materializeFreshWorkspaceSeed(input: {
     const receiptStat = await lstat(receiptPath);
     if (!receiptStat.isFile() || receiptStat.isSymbolicLink()) throw new Error("Fresh workspace seed receipt changed");
     const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
-    if (receipt.runId !== input.runId || receipt.companyId !== input.companyId || receipt.issueId !== input.issueId)
+    if (receipt.runId !== input.runId || receipt.companyId !== input.companyId || receipt.issueId !== input.issueId ||
+        (input.expectedCommit && receipt.commit !== input.expectedCommit))
       throw new Error("Fresh workspace seed receipt changed");
     return destination;
   }
@@ -119,16 +121,30 @@ export async function materializeFreshWorkspaceSeed(input: {
         // replace a recorded repository with an empty workspace.
         throw error;
       });
+    if (input.expectedCommit && !probe) throw new Error("The approved fresh workspace source is unavailable");
     let commit: string | null = null;
     if (probe) {
       const ref = input.baseRef || "HEAD";
       const resolved = await execFile("git", ["-C", input.sourceCwd, "rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`], gitOptions);
       commit = resolved.stdout.trim();
       if (!/^[a-f0-9]{40,64}$/.test(commit)) throw new Error("Invalid fresh workspace seed commit");
-      await execFile("git", ["clone", "--no-local", "--no-checkout", "--", input.sourceCwd, staging], gitOptions);
+      if (input.expectedCommit) {
+        if (commit !== input.expectedCommit) throw new Error("The approved fresh workspace commit changed");
+        // A default clone does not copy refs reachable only from the cache's
+        // remote-tracking namespace. Fetch this verified ref into its own object store.
+        await execFile("git", ["-C", staging, "init", "--template="], gitOptions);
+        await execFile("git", ["-C", staging, "-c", "protocol.file.allow=always", "fetch",
+          "--no-tags", "--no-recurse-submodules", "--", path.resolve(input.sourceCwd), ref], gitOptions);
+        const fetched = await execFile("git", ["-C", staging, "rev-parse", "--verify", "FETCH_HEAD"], gitOptions);
+        if (fetched.stdout.trim() !== input.expectedCommit)
+          throw new Error("The approved fresh workspace commit changed during transfer");
+      } else {
+        await execFile("git", ["clone", "--no-local", "--no-checkout", "--", input.sourceCwd, staging], gitOptions);
+      }
       await execFile("git", ["-C", staging, "-c", "core.hooksPath=/dev/null", "checkout", "--detach", commit], gitOptions);
       // The old local directory is not a publication target for this attempt.
-      await execFile("git", ["-C", staging, "remote", "remove", "origin"], gitOptions);
+      if (!input.expectedCommit)
+        await execFile("git", ["-C", staging, "remote", "remove", "origin"], gitOptions);
       if (input.repoUrl) await execFile("git", ["-C", staging, "remote", "add", "origin", input.repoUrl], gitOptions);
     }
     await writeFile(receiptPath, JSON.stringify({

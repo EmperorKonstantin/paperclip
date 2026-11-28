@@ -1031,7 +1031,8 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
     const cwd = await materializeFreshWorkspaceSeed({
       companyId: agent.companyId, issueId, runId: run.id, sourceCwd: executionWorkspaceBase.baseCwd,
       repoUrl: executionWorkspaceBase.repoUrl,
-      baseRef: expectedCheckout?.sha ?? readNonEmptyString(parseObject(mergedConfig.workspaceStrategy).baseRef) ?? executionWorkspaceBase.repoRef,
+      baseRef: expectedCheckout?.baseRef ?? readNonEmptyString(parseObject(mergedConfig.workspaceStrategy).baseRef) ?? executionWorkspaceBase.repoRef,
+      expectedCommit: expectedCheckout?.sha,
       beforeCopy: verifySourceAccess,
     });
     await verifySourceAccess();
