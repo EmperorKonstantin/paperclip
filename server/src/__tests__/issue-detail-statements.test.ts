@@ -75,6 +75,35 @@ describeEmbeddedPostgres("GET /api/issues/:id statements per request", () => {
     }
   }, 60_000);
 
+  it("omits the internal Untzr binding from issue detail, lists, and updates", async () => {
+    const fixture = await seed();
+    await ctx.db.update(issues).set({
+      untzrExecution: { subject: "private-subject", grantId: randomUUID() },
+    }).where(eq(issues.id, fixture.issue.id));
+
+    const app = boardSessionApp(ctx.db, () => fixture.userId);
+    const path = `/api/issues/${fixture.issue.id}`;
+    for (const view of ["", "?view=core"]) {
+      const { body } = await request(app).get(path + view).expect(200);
+      expect(body).not.toHaveProperty("untzrExecution");
+    }
+    const list = await request(app).get(`/api/companies/${fixture.companyId}/issues`).expect(200);
+    const listed = list.body.find((issue: { id: string }) => issue.id === fixture.issue.id);
+    expect(listed).toBeDefined();
+    expect(listed).not.toHaveProperty("untzrExecution");
+    const updated = await request(app).patch(path).send({ title: "Updated issue" }).expect(200);
+    expect(updated.body).not.toHaveProperty("untzrExecution");
+
+    const nestedPayload = { result: { untzrExecution: { source: "user-provided JSON" } } };
+    app.get(path + "/serialization-probe", (_req, res) => { res.json(nestedPayload); });
+    await request(app).get(path + "/serialization-probe").expect(200, nestedPayload);
+
+    const downstreamPath = "/api/serialization-probe";
+    const downstreamPayload = { result: fixture.issue };
+    app.get(downstreamPath, (_req, res) => { res.json(downstreamPayload); });
+    await request(app).get(downstreamPath).expect(200, JSON.parse(JSON.stringify(downstreamPayload)));
+  });
+
   it("keeps the access rules: another company's user, a missing issue and a hidden issue", async () => {
     const fixture = await seed();
     const outsider = await seedBoardRouteFixture(ctx.db, "Outsider");

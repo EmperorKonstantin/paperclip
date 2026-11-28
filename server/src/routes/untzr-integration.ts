@@ -256,7 +256,8 @@ export function untzrIntegrationRoutes(db: Db, storage: StorageService, options:
 
     const attachment = await issueService(db).getAttachmentById(report.attachmentId);
     if (!attachment || attachment.companyId !== scope.companyId || attachment.issueId !== issue.id ||
-        (attachment.originatingRunId && attachment.originatingRunId !== source.runId) ||
+        attachment.originatingRunId !== source.runId ||
+        attachment.createdByAgentId !== source.agentId || attachment.createdByUserId !== null ||
         attachment.sha256 !== report.sha256 || attachment.byteSize < 1 || attachment.byteSize > maxSourceBytes)
       throw forbidden("Untzr source attachment does not match the bounded report");
 

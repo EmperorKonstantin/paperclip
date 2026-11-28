@@ -3632,6 +3632,27 @@ async function recordAgentChildTaskRead(db: Db, req: Request, issue: { id: strin
 /** How long a Retry answer waits for admission before it reports the saved request as accepted. */
 const TASK_RETRY_ANSWER_ADMISSION_WAIT_MS = 5_000;
 
+// Issue responses can contain full task rows at several levels, including
+// detail, collections, and mutation receipts. Keep the stored grant private.
+function redactIssueExecutionBinding(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactIssueExecutionBinding);
+  if (!value || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) {
+    return value;
+  }
+  const record = value as Record<string, unknown>;
+  // Issue rows carry database timestamps. JSON values supplied by a caller
+  // can contain the same key and must round-trip as their original payload.
+  const isIssueRow = "untzrExecution" in record && "issueNumber" in record &&
+    "identifier" in record && typeof record.id === "string" &&
+    typeof record.companyId === "string" && typeof record.title === "string" &&
+    record.createdAt instanceof Date && record.updatedAt instanceof Date;
+  return Object.fromEntries(
+    Object.entries(record)
+      .filter(([key]) => !isIssueRow || key !== "untzrExecution")
+      .map(([key, child]) => [key, redactIssueExecutionBinding(child)]),
+  );
+}
+
 export function issueRoutes(
   db: Db,
   storage: StorageService,
@@ -3679,6 +3700,12 @@ export function issueRoutes(
   } = {},
 ) {
   const router = Router();
+  router.use(/^\/(?:issues|companies\/[^/]+\/issues)(?=\/|$)/, (_req, res, next) => {
+    const json = res.json.bind(res);
+    res.json = (body) => json(redactIssueExecutionBinding(body));
+    next();
+  });
+
   const svc = issueService(db);
   const runRedactions = createRunSecretRedactionRegistry(db);
   const access = accessService(db);
@@ -20935,7 +20962,9 @@ export function issueRoutes(
           originalFilename: stored.originalFilename,
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-          createdByRunId: actor.runId,
+          // Untzr source receipts rely on run provenance. An agent key's run
+          // header is caller-supplied, while the JWT binds it to the signer.
+          createdByRunId: issue.untzrExecution && actor.actorSource !== "agent_jwt" ? null : actor.runId,
         });
       } catch (err) {
         // A known 4xx means the registration transaction definitely rejected

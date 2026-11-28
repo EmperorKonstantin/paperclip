@@ -55,7 +55,8 @@ repository, and source ref.
 
 ## Source publication
 
-Untzr-bound runs use the approved read-only checkout. The trusted Untzr
+Untzr-bound runs use the approved read-only checkout, including foreground
+workspace preparation by a project provider. The trusted Untzr
 publisher holds the write credentials and derives the destination from its
 persisted assignment.
 
@@ -63,14 +64,16 @@ During the source run, upload the source changes as an issue attachment of
 at most 1 MiB. Save an `untzr-source` issue document with a Markdown body
 containing a single JSON object with `attachmentId`, `startingCommit` (a
 40-character lowercase Git SHA), and `sha256` (the lowercase digest of the
-attachment bytes). Use the signed run bearer for the document write. Retain
+attachment bytes). Use the same signed run bearer for both the attachment
+upload and the document write. Retain
 the returned `latestRevisionId` as the publication receipt.
 
 After that run succeeds, call `POST /api/private/untzr/source` with the usual
 subject and project context plus `issueId`, `runId`, `revisionId`, and the
 expected `startingCommit` from Untzr's trusted assignment. Paperclip checks the
 live user, grant, agent and repository scope, the revision's authenticated
-run attribution, and the attachment's issue, size and SHA-256. The response
+run attribution, and the attachment's matching run, agent, issue, company,
+size and SHA-256. The response
 contains those receipt identifiers, the repository identity, the report, and
 `sourceBase64`. The publisher checks the returned identity against its approved
 assignment, verifies the decoded bytes and expected starting head, and
