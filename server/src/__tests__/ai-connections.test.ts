@@ -52,6 +52,7 @@ import { execute as executeGemini, testEnvironment as testGeminiEnvironment } fr
 import { toolAccessService } from "../services/tool-access.js";
 import { secretService } from "../services/secrets.js";
 import { resolveExecutionRunAdapterConfig } from "../services/heartbeat.js";
+import * as heartbeatModule from "../services/heartbeat.js";
 import { aiConnectionBindingSchema, connectionPurposeTransportSchema, isAiConnectionCompatible } from "@paperclipai/shared";
 import { openRouterClaudeHeaders } from "@paperclipai/shared/openrouter-attribution";
 import { createServer } from "node:http";
@@ -141,6 +142,98 @@ describe("managed AI connections", () => {
     const authorizationGeneration = current.grant.providerTenant?.authorizationGeneration;
     expect(authorizationGeneration).toEqual(expect.any(String));
     expect(await service.credential(await select({ ...saved, authorizationGeneration }))).toBe("fixture-reconnected");
+  });
+
+  it("launches an Untzr successor at the published commit with the same personal grant", async () => {
+    const users = ["untzr-publisher-alice", "untzr-publisher-bob"];
+    const now = new Date();
+    await db.insert(authUsers).values(users.map(id => ({
+      id, name: id, email: `${id}@example.test`, createdAt: now, updatedAt: now,
+    })));
+    await db.insert(companyMemberships).values(users.map(principalId => ({
+      companyId, principalId, principalType: "user", status: "active", membershipRole: "owner",
+    })));
+    const grants = await Promise.all(users.map(id => create(id, id)));
+    const [project] = await db.insert(projects).values({
+      companyId, name: "Publisher test", visibility: "private",
+      executionWorkspacePolicy: { enabled: true, allowIssueOverride: true, defaultMode: "isolated_workspace",
+        workspaceStrategy: { type: "git_worktree" } },
+    }).returning();
+    const repository = "example/publisher-fixture";
+    const [workspace] = await db.insert(projectWorkspaces).values({
+      companyId, projectId: project.id, name: "Checkout", repoUrl: `https://github.com/${repository}.git`, repoRef: "main",
+      metadata: { githubRepositoryId: "83", githubRepositoryPrivate: true, githubRepositoryUrl: `https://github.com/${repository}` },
+    }).returning();
+    const stages = await db.insert(agents).values(["Implement", "Review"].map(name => ({
+      companyId, name: `Publisher ${name}`, adapterType: "paperclip_runner" as const,
+      adapterConfig: { provider: "acpx", acpxAgent: "claude" },
+    }))).returning();
+    await db.insert(projectAccessMembers).values([
+      ...users.map(subjectId => ({ companyId, projectId: project.id, subjectType: "user" as const, subjectId })),
+      ...stages.map(({ id: subjectId }) => ({ companyId, projectId: project.id, subjectType: "agent" as const, subjectId })),
+    ]);
+    const integrationKey = "fixture-untzr-publisher-only-key";
+    const scopes = JSON.stringify(users.map(userId => ({
+      companyId, projectId: project.id, workspaceId: workspace.id, repositoryId: "83", repository, ref: "main",
+      userId, subject: userId, agentIds: stages.map(agent => agent.id),
+    })));
+    const previousScopes = process.env.PAPERCLIP_UNTZR_SCOPES;
+    const previousKey = process.env.PAPERCLIP_UNTZR_INTEGRATION_KEY_SHA256;
+    const previousProjects = process.env.PAPERCLIP_GITHUB_APP_PROJECTS;
+    vi.stubEnv("PAPERCLIP_UNTZR_SCOPES", scopes);
+    vi.stubEnv("PAPERCLIP_GITHUB_APP_PROJECTS", JSON.stringify([{
+      companyId, projectId: project.id, workspaceId: workspace.id, repositoryId: "83", agentIds: stages.map(agent => agent.id),
+    }]));
+    vi.stubEnv("PAPERCLIP_UNTZR_INTEGRATION_KEY_SHA256", createHash("sha256").update(integrationKey).digest("hex"));
+    const settings = settingsModule.instanceSettingsService(db);
+    const previous = await settings.getExperimental();
+    await settings.updateExperimental({ enableIsolatedWorkspaces: true });
+    const realHeartbeatService = heartbeatModule.heartbeatService;
+    const wakeup = vi.fn();
+    const mockedHeartbeat = vi.spyOn(heartbeatModule, "heartbeatService").mockImplementation((...args) => ({
+      ...realHeartbeatService(...args), wakeup,
+    }));
+    try {
+      const storage = createStorageService(createLocalDiskStorageProvider(path.join(home, "launch-test-storage")));
+      const app = express();
+      app.use(express.json());
+      app.use(untzrIntegrationRoutes(db, storage, { deploymentMode: "local_trusted" }));
+      app.use(errorHandler);
+      const taskBranch = "untzr/0123456789abcdef";
+      const startingCommit = "a".repeat(40);
+      const launch = (user: number, body = {}) => request(app).post("/launch")
+        .set("Authorization", `Bearer ${integrationKey}`)
+        .send({ subject: users[user], companyId, projectId: project.id, provider: "anthropic", ...grants[user],
+          agentId: stages[0].id, title: "Scoped fixture", requestId: randomUUID(), taskBranch, startingCommit, ...body });
+      const roots = await Promise.all([launch(0), launch(1)]);
+      for (const root of roots) expect(root.status, String(root.body.error)).toBe(202);
+      expect(roots.map(root => root.body.authorizationGeneration)).toEqual(grants.map(grant => grant.grantId));
+      const rootId = roots[0].body.issueId;
+      const review = {
+        predecessorIssueId: rootId, startingCommit: "b".repeat(40), agentId: stages[1].id, requestId: randomUUID(),
+      };
+      await launch(0, review).expect(403);
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, rootId));
+      await launch(1, review).expect(403);
+      await launch(0, { ...review, taskBranch: "untzr/1123456789abcdef" }).expect(403);
+      const accepted = await launch(0, review).expect(202);
+      expect(accepted.body.authorizationGeneration).toBe(grants[0].grantId);
+      const retry = await launch(0, review).expect(202);
+      expect(retry.body.issueId).toBe(accepted.body.issueId);
+      await launch(0, { ...review, startingCommit: "c".repeat(40) }).expect(409);
+      const [saved] = await db.select().from(issues).where(eq(issues.id, accepted.body.issueId));
+      expect(saved.responsibleUserId).toBe(users[0]);
+      expect(saved.untzrExecution).toMatchObject({
+        ...grants[0], publication: { taskBranch, predecessorIssueId: rootId, startingCommit: review.startingCommit },
+      });
+      expect(wakeup).toHaveBeenCalledWith(stages[1].id, expect.objectContaining({ requestedByActorId: users[0] }));
+    } finally {
+      mockedHeartbeat.mockRestore();
+      await settings.updateExperimental({ enableIsolatedWorkspaces: previous.enableIsolatedWorkspaces });
+      vi.stubEnv("PAPERCLIP_UNTZR_SCOPES", previousScopes);
+      vi.stubEnv("PAPERCLIP_UNTZR_INTEGRATION_KEY_SHA256", previousKey);
+      vi.stubEnv("PAPERCLIP_GITHUB_APP_PROJECTS", previousProjects);
+    }
   });
 
   it("checks Untzr checkout stage and live grant before requesting GitHub credentials", async () => {

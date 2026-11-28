@@ -62,6 +62,7 @@ import {
   cleanupExecutionWorkspaceArtifacts,
   ensurePersistedExecutionWorkspaceAvailable,
   realizeExecutionWorkspace,
+  verifyExpectedGitCheckout,
   renderWorkspaceTemplate, sanitizeBranchName,
   type ExecutionWorkspaceInput,
   type RealizedExecutionWorkspace,
@@ -859,7 +860,8 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
   const skipHostProvision = copyOnlyProvisioning || hostProvisionDriver === "sandbox" || hostProvisionDriver === "ssh" || hostProvisionDriver === "plugin";
   const hostExecutionWorkspaceConfig = controllerOnly ? {} :
     stripHostWorkspaceProvision({
-      config: (fresh || useIsolatedTaskDirectory) && !remoteAuthority ? { ...mergedConfig, workspaceStrategy: { type: "project_primary" } } : mergedConfig,
+      config: ((fresh && !publication) || useIsolatedTaskDirectory) && !remoteAuthority
+        ? { ...mergedConfig, workspaceStrategy: { type: "project_primary" } } : mergedConfig,
       skipHostProvision,
     });
   const executionWorkspaceBase = {
@@ -1021,10 +1023,15 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
         onBehalfOfUserId: responsibleUserId === "local-board" ? null : responsibleUserId,
       }, agent.companyId, { issueId });
     };
+    if (expectedCheckout) {
+      await verifySourceAccess();
+      await verifyExpectedGitCheckout(executionWorkspaceBase.baseCwd, workspaceGitAuthProvider);
+      await controllerLease.assertOwned();
+    }
     const cwd = await materializeFreshWorkspaceSeed({
       companyId: agent.companyId, issueId, runId: run.id, sourceCwd: executionWorkspaceBase.baseCwd,
       repoUrl: executionWorkspaceBase.repoUrl,
-      baseRef: readNonEmptyString(parseObject(mergedConfig.workspaceStrategy).baseRef) ?? executionWorkspaceBase.repoRef,
+      baseRef: expectedCheckout?.sha ?? readNonEmptyString(parseObject(mergedConfig.workspaceStrategy).baseRef) ?? executionWorkspaceBase.repoRef,
       beforeCopy: verifySourceAccess,
     });
     await verifySourceAccess();

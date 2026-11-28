@@ -12095,6 +12095,9 @@ export function issueService(db: Db) {
           const [source] = await tx.select().from(issues).where(and(
             eq(issues.id, expectedImplementation.issueId), eq(issues.companyId, existing.companyId),
           )).for("update");
+          if (source?.untzrExecution?.publication) {
+            throw forbidden("Publisher stages require a trusted Untzr launch with an approved checkout");
+          }
           const [active] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
             eq(heartbeatRuns.companyId, existing.companyId),
             or(inArray(heartbeatRuns.issueId, issueIds), inArray(heartbeatRuns.nativeIssueId, issueIds),

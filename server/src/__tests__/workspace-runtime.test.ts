@@ -739,6 +739,21 @@ describe("refreshRemoteTrackingBaseRef git auth", () => {
     await expect(realizeWorktreeForTest(repoRoot, baseRef, approved)).rejects.toThrow("approved Untzr starting commit");
     expect(await readGit(repoRoot, ["rev-parse", baseRef])).toBe(moved);
     expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(startingCommit);
+    const retained = workspace.cwd + ".retained";
+    await fs.rename(workspace.cwd, retained);
+    await expect(ensurePersistedExecutionWorkspaceAvailable({
+      resolveGitAuth: approved,
+      base: workspace,
+      workspace: {
+        id: "workspace-1", mode: "isolated_workspace", strategyType: "git_worktree",
+        cwd: workspace.cwd, providerRef: workspace.cwd, projectId: "project-1", projectWorkspaceId: "workspace-1",
+        repoUrl: null, baseRef, branchName: workspace.branchName, metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+      },
+      issue: { id: "issue-1", identifier: "PAP-447", title: "Restore" },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+    })).rejects.toThrow("approved Untzr starting commit");
+    await expect(fs.stat(workspace.cwd)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readGit(retained, ["rev-parse", "HEAD"])).toBe(startingCommit);
   });
 
   it("attributes a failed authenticated fetch to the credential that was used", async () => {

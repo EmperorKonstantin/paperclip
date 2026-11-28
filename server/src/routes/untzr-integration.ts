@@ -29,7 +29,9 @@ const launch = context.extend({
   title: z.string().trim().min(1).max(240), description: z.string().max(100_000).optional(),
   taskBranch: untzrPublicationSchema.shape.taskBranch.optional(),
   startingCommit: untzrPublicationSchema.shape.startingCommit.optional(),
-}).refine(body => (body.taskBranch === undefined) === (body.startingCommit === undefined), {
+  predecessorIssueId: uuid.optional(),
+}).refine(body => (body.taskBranch === undefined) === (body.startingCommit === undefined) &&
+    (!body.predecessorIssueId || Boolean(body.taskBranch)), {
   message: "Publisher launches require both the approved task branch and starting commit",
 });
 
@@ -171,6 +173,19 @@ export function untzrIntegrationRoutes(db: Db, storage: StorageService, options:
       agentHarnessType(agent.adapterType, agent.adapterConfig) === harness);
     if (!stageAgents.some(agent => agent.id === body.agentId))
       throw forbidden("The selected agent cannot run this Untzr provider");
+    const predecessor = body.predecessorIssueId ? await db.select({
+      status: issues.status, untzrExecution: issues.untzrExecution,
+    }).from(issues).where(and(eq(issues.companyId, companyId), eq(issues.projectId, scope.projectId),
+      eq(issues.projectWorkspaceId, scope.workspaceId), eq(issues.id, body.predecessorIssueId)))
+      .then(rows => rows[0]) : null;
+    const prior = predecessor?.untzrExecution ? untzrExecutionSchema.parse(predecessor.untzrExecution) : null;
+    if (body.predecessorIssueId && (predecessor?.status !== "done" || !prior?.publication ||
+        prior.subject !== scope.subject || prior.userId !== scope.userId ||
+        prior.repositoryId !== scope.repositoryId || prior.repository !== scope.repository ||
+        prior.provider !== body.provider || prior.connectionId !== body.connectionId || prior.grantId !== body.grantId ||
+        prior.publication.taskBranch !== body.taskBranch || !prior.stageAgents[body.agentId])) {
+      throw forbidden("The stage does not match the approved Untzr predecessor and grant");
+    }
     const [grant] = await db.select({ config: toolConnections.config, providerTenant: connectionGrants.providerTenant }).from(toolConnections)
       .innerJoin(connectionGrants, and(eq(connectionGrants.companyId, companyId),
         eq(connectionGrants.connectionId, toolConnections.id), eq(connectionGrants.id, body.grantId),
@@ -178,16 +193,22 @@ export function untzrIntegrationRoutes(db: Db, storage: StorageService, options:
       .where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.id, body.connectionId),
         eq(toolConnections.connectionPurpose, "ai")));
     const metadata = aiConnectionMetadataSchema.safeParse(grant?.config.ai);
-    if (!metadata.success || metadata.data.provider !== body.provider) throw forbidden("Choose an approved personal AI connection");
+    if (!metadata.success || metadata.data.provider !== body.provider ||
+        (prior && (prior.authorizationGeneration !== grant?.providerTenant?.authorizationGeneration ||
+          prior.method !== metadata.data.method))) {
+      throw forbidden("Choose an approved personal AI connection");
+    }
     const parsed = untzrExecutionSchema.safeParse({ ...scope, provider: body.provider, method: metadata.data.method,
       connectionId: body.connectionId, grantId: body.grantId, authorizationGeneration: grant?.providerTenant?.authorizationGeneration,
-      publication: body.taskBranch ? { taskBranch: body.taskBranch, startingCommit: body.startingCommit } : undefined,
-      stageAgents: Object.fromEntries(stageAgents.map(agent => [
+      publication: body.taskBranch ? {
+        taskBranch: body.taskBranch, startingCommit: body.startingCommit, predecessorIssueId: body.predecessorIssueId,
+      } : undefined,
+      stageAgents: Object.fromEntries(stageAgents.filter(agent => !prior || prior.stageAgents[agent.id]).map(agent => [
         agent.id, { adapter: agent.adapterType, harness: agentHarnessType(agent.adapterType, agent.adapterConfig) },
       ])), });
     if (!parsed.success) throw forbidden("The approved Untzr agents or connection method are incompatible");
     const execution = parsed.data;
-    for (const agent of stageAgents) {
+    for (const agent of stageAgents.filter(agent => execution.stageAgents[agent.id])) {
       await assertUntzrExecution(db, execution, { ...scope, agentId: agent.id, adapter: agent.adapterType, config: agent.adapterConfig });
     }
     const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
