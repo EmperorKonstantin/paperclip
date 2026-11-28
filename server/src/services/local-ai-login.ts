@@ -197,7 +197,7 @@ export function localAiLoginService(db: Db) {
     } finally { clearTimeout(timeout); }
   }
 
-  async function start(companyId: string, userId: string, intent: AiConnectionLoginIntent, restart = false, managementContext?: ConnectionManagementContext): Promise<LocalAiLoginAttempt> {
+  async function start(companyId: string, userId: string, intent: AiConnectionLoginIntent, restart = false, managementContext?: ConnectionManagementContext, integrationScope: string | null = null): Promise<LocalAiLoginAttempt> {
     if (!["openai", "xai", "anthropic", "google"].includes(intent.provider))
       throw unprocessable("This provider does not use a separate local login home.");
     // Expiry is owned by the durable localLoginCleanup deadline. Starting a
@@ -211,7 +211,7 @@ export function localAiLoginService(db: Db) {
         eq(adapterAuthSessions.adapterType, adapterType), inArray(adapterAuthSessions.status, [...ADAPTER_AUTH_SESSION_ACTIVE_STATES]),
       ));
       if (existing) {
-        if (existing.connectionMethod !== LOCAL_LOGIN_METHOD) throw unprocessable("Another sign-in is still open. Finish or cancel it before starting again.");
+        if (existing.connectionMethod !== LOCAL_LOGIN_METHOD || existing.integrationScope !== integrationScope) throw unprocessable("Another sign-in is still open. Finish or cancel it before starting again.");
         retiredAttemptId = existing.id;
         await retireOwnedAttempt(companyId, userId, existing.id, managementContext);
       }
@@ -225,7 +225,7 @@ export function localAiLoginService(db: Db) {
       )).for("update");
       if (existing) {
         if (!restart && existing.connectionMethod === LOCAL_LOGIN_METHOD && existing.status === "waiting_for_user" &&
-            existing.aiConnection && sameTarget(existing.aiConnection, intent) &&
+            existing.integrationScope === integrationScope && existing.aiConnection && sameTarget(existing.aiConnection, intent) &&
             existing.expiresAt && existing.expiresAt.getTime() > Date.now()) {
           await prepareHome(existing.id, intent.provider);
           return presentAttempt(existing.id, existing.expiresAt, intent.provider);
@@ -267,7 +267,7 @@ export function localAiLoginService(db: Db) {
         await tx.insert(adapterAuthSessions).values({
           id, publicSessionId: id, companyId, environmentId: environment.id,
           adapterType,
-          startedByUserId: userId, aiConnection: intent,
+          startedByUserId: userId, aiConnection: intent, integrationScope,
           connectionMethod: LOCAL_LOGIN_METHOD, status: "waiting_for_user", expiresAt,
         });
         await logActivity(tx as unknown as Db, {
@@ -290,7 +290,7 @@ export function localAiLoginService(db: Db) {
 
   // Read-only credential detection: never saves a connection or refreshes another
   // login. Scope and intent are checked before touching an attempt's directory.
-  async function check(companyId: string, userId: string, intent: AiConnectionLoginIntent, id?: string): Promise<LocalAiLoginStatus> {
+  async function check(companyId: string, userId: string, intent: AiConnectionLoginIntent, id?: string, integrationScope: string | null = null): Promise<LocalAiLoginStatus> {
     let directory: string | undefined;
     {
       if (!id) throw unprocessable(intent.provider === "xai"
@@ -301,7 +301,7 @@ export function localAiLoginService(db: Db) {
         eq(adapterAuthSessions.startedByUserId, userId),
         eq(adapterAuthSessions.connectionMethod, LOCAL_LOGIN_METHOD),
       ));
-      if (!session?.aiConnection || !sameTarget(session.aiConnection, intent))
+      if (!session?.aiConnection || session.integrationScope !== integrationScope || !sameTarget(session.aiConnection, intent))
         throw notFound("Local sign-in attempt not found for this connection.");
       if (session.status === "authenticated" || session.connectionId)
         return { status: "expired", error: "This sign-in already connected the account." };
@@ -339,7 +339,7 @@ export function localAiLoginService(db: Db) {
       eq(adapterAuthSessions.id, id), eq(adapterAuthSessions.companyId, companyId),
       eq(adapterAuthSessions.startedByUserId, userId), eq(adapterAuthSessions.connectionMethod, LOCAL_LOGIN_METHOD),
     ));
-    if (!existing) throw notFound("Local sign-in attempt not found.");
+    if (!existing || existing.integrationScope !== null) throw notFound("Local sign-in attempt not found.");
     const isClaude = existing.adapterType === "claude_local";
     const isGoogle = existing.adapterType === "paperclip_runner" && existing.aiConnection?.provider === "google";
     if (!isClaude && !isGoogle) throw notFound("Local sign-in attempt not found.");
@@ -397,7 +397,7 @@ export function localAiLoginService(db: Db) {
     });
   }
 
-  async function complete(companyId: string, userId: string, id: string, intent: AiConnectionLoginIntent, managementContext?: ConnectionManagementContext) {
+  async function complete(companyId: string, userId: string, id: string, intent: AiConnectionLoginIntent, managementContext?: ConnectionManagementContext, integrationScope: string | null = null) {
     await managementContext?.reauthorize();
     const result = await db.transaction(async (tx) => {
       const [session] = await tx.select().from(adapterAuthSessions).where(and(
@@ -406,7 +406,7 @@ export function localAiLoginService(db: Db) {
         // Successful completion replaces connectionMethod with subscription.
         sql`${adapterAuthSessions.providerLeaseId} is null`,
       )).for("update");
-      if (!session || !session.aiConnection || !sameTarget(session.aiConnection, intent))
+      if (!session?.aiConnection || session.integrationScope !== integrationScope || !sameTarget(session.aiConnection, intent))
         throw notFound("Local sign-in attempt not found for this connection.");
       if (session.connectionId && session.connectionGrantId)
         return { connectionId: session.connectionId, grantId: session.connectionGrantId };
@@ -435,13 +435,13 @@ export function localAiLoginService(db: Db) {
     return result;
   }
 
-  async function cancel(companyId: string, userId: string, id: string, managementContext?: ConnectionManagementContext) {
+  async function cancel(companyId: string, userId: string, id: string, managementContext?: ConnectionManagementContext, integrationScope: string | null = null) {
     await managementContext?.reauthorize();
     const [owned] = await db.select().from(adapterAuthSessions).where(and(
       eq(adapterAuthSessions.id, id), eq(adapterAuthSessions.companyId, companyId),
       eq(adapterAuthSessions.startedByUserId, userId), eq(adapterAuthSessions.connectionMethod, LOCAL_LOGIN_METHOD),
     ));
-    if (!owned) throw notFound("Local sign-in attempt not found.");
+    if (!owned || owned.integrationScope !== integrationScope) throw notFound("Local sign-in attempt not found.");
     await retireOwnedAttempt(companyId, userId, id, managementContext);
     await db.transaction(async (tx) => {
       const [session] = await tx.select().from(adapterAuthSessions).where(and(

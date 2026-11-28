@@ -52,6 +52,7 @@ export const adapterAuthSessions = pgTable(
     connectionId: uuid("connection_id"),
     connectionGrantId: uuid("connection_grant_id"),
     connectionMethod: text("connection_method"),
+    integrationScope: text("integration_scope"),
     adapterType: text("adapter_type").$type<AgentAdapterType>().notNull(),
     // The immutable owner principal. The service sets this column one time at
     // create and never updates it. The service returns the prompt only to this

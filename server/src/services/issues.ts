@@ -11200,8 +11200,20 @@ export function issueService(db: Db) {
               .then((rows) => rows.length > 0));
           if (!originPublic) originIssueId = null;
         }
+        // Follow the creating run before the requested parent. A stage cannot
+        // discard its authorizing account by creating work under another task.
+        const untzrSources = [...new Set([runSourceIssueId, privacyParentIssueId].filter((id): id is string => Boolean(id)))];
+        const inheritedUntzr = untzrSources.length ? await tx.select({ execution: issues.untzrExecution })
+          .from(issues).where(and(eq(issues.companyId, companyId), inArray(issues.id, untzrSources))) : [];
+        const inheritedExecution = inheritedUntzr.find(source => source.execution)?.execution;
+        if (inheritedExecution && (inheritedUntzr.some(source => source.execution &&
+            !isDeepStrictEqual(source.execution, inheritedExecution)) ||
+            issueData.projectId !== inheritedExecution.projectId || projectWorkspaceId !== inheritedExecution.workspaceId)) {
+          throw forbidden("A follow-up must keep its approved Untzr project and workspace");
+        }
         const values = {
           ...issueData,
+          untzrExecution: inheritedExecution ?? issueData.untzrExecution,
           workspaceSelection: workspaceIntent,
           visibility,
           privacyRootIssueId,
@@ -11212,7 +11224,7 @@ export function issueService(db: Db) {
           originIssueId,
           titleNeedsGeneration,
           originRunId: issueData.originRunId ?? actorRunId ?? null,
-          responsibleUserId,
+          responsibleUserId: inheritedExecution ? String(inheritedExecution.userId) : responsibleUserId,
           requestDepth: clampIssueRequestDepth(issueData.requestDepth),
           originKind: issueData.originKind ?? "manual",
           goalId: resolveIssueGoalId({
@@ -11805,6 +11817,7 @@ export function issueService(db: Db) {
         expectedParentId: _expectedParentId,
         // Creation provenance never changes after create.
         originIssueId: _originIssueId,
+        untzrExecution: _untzrExecution,
         ...issueData
       } = data;
       if (expectedCompletedAssignee !== undefined) {
@@ -12016,6 +12029,13 @@ export function issueService(db: Db) {
         patch.executionWorkspaceSettings = nextExecutionWorkspaceSettings
           ? { ...nextExecutionWorkspaceSettings }
           : null;
+      }
+      if (existing.untzrExecution &&
+          (nextProjectId !== existing.projectId || nextProjectWorkspaceId !== existing.projectWorkspaceId ||
+            nextExecutionWorkspaceId !== existing.executionWorkspaceId ||
+            nextExecutionWorkspacePreference !== existing.executionWorkspacePreference ||
+            !isDeepStrictEqual(nextExecutionWorkspaceSettings, parseIssueExecutionWorkspaceSettings(existing.executionWorkspaceSettings)))) {
+        throw forbidden("The approved Untzr task workspace cannot be changed");
       }
       if (nextProjectWorkspaceId) await assertValidProjectWorkspace(existing.companyId, null, nextProjectWorkspaceId);
       if (nextExecutionWorkspaceId) await assertValidExecutionWorkspace(existing.companyId, null, nextExecutionWorkspaceId);

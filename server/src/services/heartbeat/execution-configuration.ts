@@ -26,6 +26,7 @@ import { PLUGIN_RUNNER_AI_CONNECTION_REQUIRED, pluginEnvironmentRunnerTaskDriver
 import { prepareConnectionInstructionDelivery } from "../connection-instructions.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "../connector-runtime.js";
 import { resolveManagedGitHubIdentitySelection } from "../git-credentials.js";
+import { assertUntzrExecution, readUntzrIssueExecution, untzrAiBinding } from "../untzr-execution.js";
 import { githubAppProjectBinding } from "../github-app-credentials.js";
 import { resolveAssignedConnectionInstructionsForRun, resolveMcpConnectionSkillsForRun } from "../native-runtime/assigned-mcp-tools.js";
 import { applyMcpConnectionSkills } from "../mcp-skill-runtime.js";
@@ -133,6 +134,26 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
         homeMode: bindHeartbeatRunnerHomeMode({ ...parseObject(agent.adapterConfig), ...(sshRunnerHomeMode ? { homeMode: sshRunnerHomeMode } : {}) }, persistedNativeExecutionInput).homeMode }
     : input.config.sourceWorkspaceConfig;
   const preconfiguredHome = agent.adapterType === "paperclip_runner" && sourceWorkspaceConfig.homeMode === "preconfigured";
+  const untzrTask = issueId ? await readUntzrIssueExecution(db, agent.companyId, issueId) : null;
+  const untzr = untzrTask?.execution;
+  if (untzr) {
+    try {
+      if (preconfiguredHome || useSshHostAuth || responsibleUserId !== untzr.userId ||
+          taskProjectContext?.id !== untzr.projectId) {
+        throw new Error("The run no longer has its authorized Untzr identity, project, and isolated home.");
+      }
+      await assertUntzrExecution(db, untzr, {
+        companyId: agent.companyId, projectId: untzrTask.projectId, workspaceId: untzrTask.workspaceId,
+        agentId: agent.id, adapter: agent.adapterType, config: sourceWorkspaceConfig,
+      });
+    } catch {
+      throw new ConfigurationIncompleteFailure("The approved Untzr connection or execution scope is unavailable. Reconnect or check the project authorization.", {
+        configurationIncomplete: { reason: "untzr_execution_unavailable", actionUrl: `/agents/${agent.id}/runtime` },
+      });
+    }
+  }
+  const requestedAiBinding = untzr ? untzrAiBinding(untzr) : input.config.aiBinding;
+
   if (preconfiguredHome && pinnedSkillTest) {
     throw new ConfigurationIncompleteFailure("Skill tests require an isolated Runner home to deliver the saved version.", {
       configurationIncomplete: { reason: "skill_unavailable", actionUrl: `/agents/${agent.id}/runtime` },
@@ -141,7 +162,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   // A plugin Runner-task environment runs only managed AI connections. Refuse a new
   // admission before secrets, leases, or provider calls. Resumed native input keeps
   // the contract it was admitted under.
-  if (agent.adapterType === "paperclip_runner" && (preconfiguredHome || !input.config.aiBinding) && !persistedNativeExecutionInput
+  if (agent.adapterType === "paperclip_runner" && (preconfiguredHome || !requestedAiBinding) && !persistedNativeExecutionInput
     && selectedEnvironmentForConfig && await pluginEnvironmentRunnerTaskDriver(db, selectedEnvironmentForConfig)) {
     throw new ConfigurationIncompleteFailure(pluginRunnerAiConnectionRequiredMessage(preconfiguredHome), {
       configurationIncomplete: { reason: PLUGIN_RUNNER_AI_CONNECTION_REQUIRED, actionUrl: `/agents/${agent.id}/runtime`,
@@ -164,7 +185,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   // The executor keeps these values in its failure redactor before any later
   // preparation step can fail. Subsequent provider/identity values extend it.
   onFailureSecretsResolved(() => []);
-  const aiBinding = preconfiguredHome || useSshHostAuth ? undefined : input.config.aiBinding;
+  const aiBinding = preconfiguredHome || useSshHostAuth ? undefined : requestedAiBinding;
   if (selectedEnvironmentForConfig?.driver === "ssh" && selectedEnvironmentForConfig.config.useHostAuth === false && !aiBinding && !persistedNativeExecutionInput) {
     throw new ConfigurationIncompleteFailure("Select an AI account for this agent or enable authentication configured on the remote machine in the SSH environment's advanced settings.", {
       configurationIncomplete: { reason: "ssh_ai_connection_required", actionUrl: `/agents/${agent.id}/runtime` },
@@ -238,7 +259,8 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   identityRedactor.addSecretValues(secretEnvironmentValues(resolvedConfig.env, secretKeys));
   if (aiBinding) {
     try {
-      managedAiRuntime = await time("configuration_ai_runtime", () => prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig }));
+      managedAiRuntime = await time("configuration_ai_runtime", () => prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig,
+        ...(untzr ? { pinnedPersonalGrant: untzr, allowUninstalledPersonal: true } : {}) }));
       onManagedAiRuntimeAcquired(managedAiRuntime);
     } catch (error) {
       // Only fresh executions can receive a pre-provider wait receipt. A
@@ -253,7 +275,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
         await finalizeAiConnectionBusyDeferral(run, error, !authorizedNonAssigneeWake);
         return { prepared: false as const };
       }
-      if (responsibleUserId && issueId) {
+      if (!untzr && responsibleUserId && issueId) {
         await connectionIntentService(db).request({ sub: agent.id, company_id: agent.companyId, run_id: run.id, responsible_user_id: responsibleUserId }, aiBinding.provider, { purpose: "ai" }).catch(() => {
           logger.warn({ runId: run.id, agentId: agent.id }, "Could not attach AI connection request; runtime configuration action remains available");
         });

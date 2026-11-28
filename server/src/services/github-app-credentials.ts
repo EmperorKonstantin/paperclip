@@ -53,13 +53,24 @@ export async function scopedGitHubAppCredential(db: Db, input: GitHubInstallatio
 
 export async function githubAppTaskCheckout(db: Db, companyId: string, issueId: string,
   agentId: string | null | undefined, remoteUrl: string, env = process.env) {
-  if (!env.PAPERCLIP_GITHUB_APP_PROJECTS) return undefined;
   const [issue] = await db.select({
     companyId: issues.companyId, projectId: issues.projectId, assigneeAgentId: issues.assigneeAgentId,
-    executionPolicy: issues.executionPolicy, sourceTrust: issues.sourceTrust, executionWorkspaceId: issues.executionWorkspaceId,
+    untzrExecution: issues.untzrExecution, executionPolicy: issues.executionPolicy, sourceTrust: issues.sourceTrust, executionWorkspaceId: issues.executionWorkspaceId,
   }).from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
+  if (issue?.untzrExecution) {
+    const { resolveUntzrScope, untzrExecutionSchema } = await import("./untzr-execution.js");
+    const execution = untzrExecutionSchema.parse(issue.untzrExecution);
+    const scope = await resolveUntzrScope(db, execution.subject, companyId, execution.projectId);
+    if (issue.projectId !== execution.projectId || scope.workspaceId !== execution.workspaceId ||
+        scope.userId !== execution.userId || scope.repositoryId !== execution.repositoryId ||
+        scope.repository !== execution.repository || scope.ref !== execution.ref ||
+        normalizeProjectRepositoryUrl(remoteUrl).fullName.toLowerCase() !== execution.repository) {
+      throw forbidden("Checkout is outside the approved Untzr repository scope");
+    }
+  }
   if (!issue?.projectId) return undefined;
   const binding = githubAppProjectBinding(companyId, issue.projectId, env);
+  if (!binding && issue.untzrExecution) throw forbidden("The Untzr GitHub binding is unavailable");
   if (!binding) return undefined;
   if (!agentId || agentId !== issue.assigneeAgentId || !binding.agentIds.includes(agentId)
     || isLowTrustQuarantined(issue.sourceTrust)) throw forbidden("GitHub App credentials require the assigned agent");

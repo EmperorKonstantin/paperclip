@@ -328,7 +328,7 @@ export function createGitRemoteAuthProvider(
 
   return async (remoteUrl: string) => {
     if (!isSupportedGitHubRemoteUrl(remoteUrl)) return null;
-    if (db && context?.issueId && env.PAPERCLIP_GITHUB_APP_PROJECTS) {
+    if (db && context?.issueId) {
       const token = await githubAppTaskCheckout(db, companyId, context.issueId, context.agentId, remoteUrl, env);
       if (token) return buildGitAuthInvocation({ token, source: "managed_connection", secretName: null });
     }

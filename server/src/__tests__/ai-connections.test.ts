@@ -82,6 +82,27 @@ beforeAll(async () => {
 afterAll(async () => { await database?.cleanup(); vi.unstubAllEnvs(); if (home) await rm(home, { recursive: true, force: true }); });
 
 describe("managed AI connections", () => {
+  it("keeps pinned personal execution grants isolated across concurrent users and revocation", async () => {
+    const users = ["untzr-alice", "untzr-bob"];
+    await db.insert(companyMemberships).values(users.map(principalId => ({
+      companyId, principalId, principalType: "user", status: "active", membershipRole: "member",
+    })));
+    const [alice, bob] = await Promise.all(users.map(userId => create(userId, userId)));
+    const select = (userId: string, pinnedPersonalGrant: typeof alice) =>
+      aiConnectionService(db).select({ ...input, userId, pinnedPersonalGrant, allowUninstalledPersonal: true });
+
+    const selected = await Promise.all([select(users[0], alice), select(users[1], bob)]);
+    expect(selected.map(result => result.attribution.connectionId)).toEqual([alice.connectionId, bob.connectionId]);
+    await expect(select(users[0], bob)).rejects.toThrow();
+    await expect(select(users[0], { ...alice, connectionId: bob.connectionId })).rejects.toThrow();
+    await expect(service.select({ ...input, companyId: otherCompanyId, userId: users[0],
+      pinnedPersonalGrant: alice, allowUninstalledPersonal: true })).rejects.toThrow();
+
+    await db.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.id, alice.grantId));
+    await expect(select(users[0], alice)).rejects.toThrow();
+    await expect(select(users[1], bob)).resolves.toMatchObject({ attribution: { grantId: bob.grantId } });
+  });
+
   it.each([
     { provider: "openrouter", envKey: "OPENROUTER_API_KEY", routed: false },
     { provider: "openrouter", envKey: "OPENROUTER_API_KEY", routed: true },

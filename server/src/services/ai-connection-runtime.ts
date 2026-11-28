@@ -220,6 +220,7 @@ export async function prepareManagedAiRuntime(
     adapterType: string;
     binding: AiConnectionBinding;
     allowUninstalledPersonal?: boolean;
+    pinnedPersonalGrant?: { connectionId: string; grantId: string };
     allowUninstalledShared?: boolean;
     allowLegacyValidation?: boolean;
     config: Record<string, unknown>;

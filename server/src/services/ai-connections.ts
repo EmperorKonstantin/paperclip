@@ -275,11 +275,14 @@ export function aiConnectionService(db: Db) {
     runnerProvider?: unknown;
     acpxAgent?: unknown;
     allowUninstalledPersonal?: boolean;
+    pinnedPersonalGrant?: { connectionId: string; grantId: string };
     allowUninstalledShared?: boolean;
     allowLegacyValidation?: boolean;
     binding: AiConnectionBinding;
   }) {
-    const { companyId, userId, agentId, binding } = input;
+    const { companyId, userId, agentId, binding, pinnedPersonalGrant } = input;
+    if (pinnedPersonalGrant && (binding.mode !== "responsible_user" || !userId))
+      throw forbidden("A pinned personal connection requires its responsible user");
     // The grant-kind checks below cover only these three modes. Callers parse
     // the binding first, but an unknown mode must never skip those checks.
     if (binding.mode !== "responsible_user" && binding.mode !== "shared" && binding.mode !== "delegated")
@@ -299,7 +302,7 @@ export function aiConnectionService(db: Db) {
     if (userId && !(await membership(companyId, userId)))
       throw forbidden("The responsible user is not an active company member");
     const defaultRow =
-      binding.mode === "responsible_user"
+      binding.mode === "responsible_user" && !pinnedPersonalGrant
         ? (
             await db
               .select()
@@ -316,15 +319,16 @@ export function aiConnectionService(db: Db) {
         : null;
     const grantId =
       binding.mode === "responsible_user"
-        ? defaultRow?.grantId
+        ? pinnedPersonalGrant?.grantId ?? defaultRow?.grantId
         : binding.grantId;
     if (!grantId)
       throw aiConnectionConfigurationFailure("ai_connection_default_missing", "Connect an account and choose your personal default");
     const row = (await rows(companyId)).find(
       (r) =>
         r.grant.id === grantId &&
-        (binding.mode === "responsible_user" ||
-          r.connection.id === binding.connectionId),
+        (binding.mode === "responsible_user"
+          ? !pinnedPersonalGrant || r.connection.id === pinnedPersonalGrant.connectionId
+          : r.connection.id === binding.connectionId),
     );
     if (!row)
       throw aiConnectionConfigurationFailure("ai_connection_missing", "The selected AI connection is unavailable");
@@ -333,7 +337,8 @@ export function aiConnectionService(db: Db) {
     if (
       !metadata.success ||
       metadata.data.provider !== binding.provider ||
-      (binding.mode !== "responsible_user" && metadata.data.method !== binding.method) ||
+      ((pinnedPersonalGrant || binding.mode !== "responsible_user") && metadata.data.method !== binding.method) ||
+      (pinnedPersonalGrant && metadata.data.routing !== undefined) ||
       !isAiConnectionCompatible(metadata.data, input.adapterType, input.model, input.runnerProvider, input.acpxAgent)
     )
       throw aiConnectionConfigurationFailure("ai_connection_incompatible", "The selected AI connection is incompatible");

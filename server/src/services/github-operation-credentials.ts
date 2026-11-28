@@ -177,9 +177,7 @@ async function resolveCapturedGitHubCredentials(db: Db, run: GitHubCredentialRun
     };
   }
   try {
-    const appToken = process.env.PAPERCLIP_GITHUB_APP_PROJECTS
-      ? await resolveGitHubAppRunToken(db, run, context)
-      : undefined;
+    const appToken = await resolveGitHubAppRunToken(db, run, context);
     if (appToken) {
       summary = { status: "available", source: "dedicated", authenticationMode: "managed" };
       await saveGitHubSummary(db, context, summary);
@@ -250,10 +248,22 @@ async function resolveGitHubAppRunToken(db: Db, run: GitHubCredentialRun, contex
   const issueId = run.issueId ?? run.nativeIssueId ?? run.contextSnapshot?.issueId ?? run.contextSnapshot?.taskId;
   if (typeof issueId !== "string" || !isUuidLike(issueId)) return undefined;
   const [issue] = await db.select({ projectId: issues.projectId, assigneeAgentId: issues.assigneeAgentId,
-    executionWorkspaceId: issues.executionWorkspaceId }).from(issues)
+    executionWorkspaceId: issues.executionWorkspaceId, untzrExecution: issues.untzrExecution,
+    projectWorkspaceId: issues.projectWorkspaceId }).from(issues)
     .where(and(eq(issues.companyId, input.companyId), eq(issues.id, issueId)));
+  if (issue?.untzrExecution) {
+    const { assertUntzrExecution, untzrExecutionSchema } = await import("./untzr-execution.js");
+    const execution = untzrExecutionSchema.parse(issue.untzrExecution);
+    const [agent] = await db.select({ adapter: agents.adapterType, config: agents.adapterConfig }).from(agents)
+      .where(and(eq(agents.companyId, companyId), eq(agents.id, agentId)));
+    if (!agent || run.responsibleUserId !== execution.userId)
+      throw forbidden("The GitHub operation is outside the approved Untzr run");
+    await assertUntzrExecution(db, execution, { companyId, agentId, projectId: issue.projectId,
+      workspaceId: issue.projectWorkspaceId, ...agent });
+  }
   if (!issue?.projectId) return undefined;
   const binding = githubAppProjectBinding(input.companyId, issue.projectId);
+  if (!binding && issue.untzrExecution) throw forbidden("The Untzr GitHub binding is unavailable");
   if (!binding) return undefined;
   const [project] = await db.select({ visibility: projects.visibility, archivedAt: projects.archivedAt }).from(projects)
     .where(and(eq(projects.companyId, input.companyId), eq(projects.id, binding.projectId)));

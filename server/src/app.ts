@@ -54,6 +54,7 @@ import { publicMcpIngressRoutes, publicMcpManagementRoutes } from "./routes/publ
 import { agentAvatarRoutes } from "./routes/agent-avatars.js";
 import { decisionModelRoutes } from "./routes/decision-models.js";
 import { agentObservabilityRoutes } from "./routes/agent-observability.js";
+import { untzrIntegrationRoutes } from "./routes/untzr-integration.js";
 import { aiConnectionRoutes } from "./routes/ai-connections.js";
 import { taskWorkspaceRoutes } from "./routes/task-workspaces.js";
 import { projectToolRoutes } from "./routes/project-tools.js";
@@ -664,6 +665,8 @@ export async function createApp(
   // board/agent bearer authentication. Mount before actorMiddleware so its
   // per-session Bearer cannot be mistaken for an agent API key.
   app.use(voiceWebhookRoutes(db, chatChannels.voice));
+  app.use("/api/private/untzr", untzrIntegrationRoutes(db, { deploymentMode: opts.deploymentMode,
+    deploymentExposure: opts.deploymentExposure }));
   app.use(
     actorMiddleware(db, {
       deploymentMode: opts.deploymentMode,

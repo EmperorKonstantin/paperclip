@@ -57,7 +57,8 @@ export type SecretSensitiveRouteFamily =
   | "mcp_oauth"
   | "api_mcp"
   | "chat_endpoint_setup"
-  | "local_ai_login_code";
+  | "local_ai_login_code"
+  | "untzr_integration";
 
 const SECRET_SENSITIVE_HTTP_PATHS: ReadonlyArray<readonly [SecretSensitiveRouteFamily, RegExp]> = [
   ["voice_sessions", /^\/api\/companies\/[^/]+\/voice-sessions(?:\/|$)/],
@@ -172,6 +173,7 @@ export function secretSensitiveRouteFamily(
   url: string | undefined,
 ): SecretSensitiveRouteFamily | null {
   if (url && /^\/api\/instance\/ephemeral-enrollment(?:\/|$)/i.test(normalizePath(url).replace(/^https?:\/\/[^/]*/i, ""))) return "ephemeral_enrollment";
+  if (url && /^\/api\/private\/untzr(?:\/|$)/i.test(normalizePath(url).replace(/^https?:\/\/[^/]*/i, ""))) return "untzr_integration";
   if (isPrivateWebhookHttpRequest(method, url)) return "provider_webhook";
   if (isPrivateMuseHttpRequest(url)) return "muse";
   if (isPrivateDotPrincipalHttpRequest(url)) return "mcp_runner";

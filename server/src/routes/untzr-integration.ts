@@ -1,0 +1,200 @@
+import { createHash } from "node:crypto";
+import { Router } from "express";
+import { and, eq, inArray } from "drizzle-orm";
+import { z } from "zod";
+import { adapterAuthSessions, agents, connectionGrants, toolConnections, type Db } from "@paperclipai/db";
+import { agentHarnessType, aiConnectionMetadataSchema, createAiConnectionSchema } from "@paperclipai/shared";
+import { conflict, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
+import { validate } from "../middleware/validate.js";
+import { logActivity } from "../services/activity-log.js";
+import { validateAiApiKey } from "../services/ai-api-key-test.js";
+import { aiConnectionService } from "../services/ai-connections.js";
+import { heartbeatService } from "../services/heartbeat.js";
+import { issueService } from "../services/issues.js";
+import { localAiLoginService } from "../services/local-ai-login.js";
+import { supportsLocalAiLogin } from "../services/local-ai-login-policy.js";
+import { assertUntzrExecution, authenticateUntzr, resolveUntzrScope, untzrExecutionSchema,
+  untzrProviderSchema, untzrSubjectSchema } from "../services/untzr-execution.js";
+
+const uuid = z.string().uuid();
+const context = z.object({ subject: untzrSubjectSchema, companyId: uuid, projectId: uuid }).strict();
+const connection = context.extend({ provider: untzrProviderSchema, connectionId: uuid.optional() });
+const apiKey = connection.extend({ apiKey: z.string().trim().min(1).max(32768) });
+const login = context.extend({ connectionId: uuid.optional(), attempt: uuid.optional() });
+const launch = context.extend({
+  provider: untzrProviderSchema, connectionId: uuid, grantId: uuid,
+  agentId: uuid, requestId: z.string().min(1).max(160),
+  title: z.string().trim().min(1).max(240), description: z.string().max(100_000).optional(),
+});
+
+export function untzrIntegrationRoutes(db: Db, options: Parameters<typeof supportsLocalAiLogin>[0]) {
+  const router = Router();
+  const heartbeat = heartbeatService(db);
+  const service = aiConnectionService(db);
+  const local = localAiLoginService(db);
+  const key = (req: { get(name: string): string | undefined }) => req.get("authorization")?.match(/^Bearer ([A-Za-z0-9._~-]{32,1024})$/)?.[1];
+  router.use((req, res, next) => {
+    if (!process.env.PAPERCLIP_UNTZR_INTEGRATION_KEY_SHA256) return next(notFound());
+    if (!authenticateUntzr(key(req))) return next(unauthorized());
+    res.setHeader("Cache-Control", "no-store");
+    next();
+  });
+
+  router.post("/status", validate(context), async (req, res) => {
+    const { companyId, userId } = await resolveScope(context.parse(req.body));
+    const accounts = await service.list(companyId, userId);
+    res.json({ codexSignInAvailable: codexEnabled(), connections: accounts
+      .filter(row => row.ownership === "personal" && row.ownerUserId === userId && !row.routing &&
+        (row.provider === "openai" || (row.provider === "anthropic" && row.method === "api_key")))
+      .map(row => ({ connectionId: row.id, grantId: row.grantId, provider: row.provider,
+        method: row.method, status: row.status })) });
+  });
+
+  router.post("/api-key", validate(apiKey), async (req, res) => {
+    const body = apiKey.parse(req.body);
+    const { companyId, userId } = await resolveScope(body);
+    const input = createAiConnectionSchema.parse({ ownership: "personal", name: `Untzr ${body.provider}`,
+      method: "api_key", provider: body.provider, apiKey: body.apiKey, connectionId: body.connectionId });
+    const startedAt = new Date();
+    await validateAiApiKey(body.provider, body.apiKey);
+    res.status(201).json(await service.save(companyId, userId, input, body.apiKey, undefined, startedAt));
+  });
+
+  router.post("/disconnect", validate(connection.required({ connectionId: true })), async (req, res) => {
+    const body = connection.required({ connectionId: true }).parse(req.body);
+    const { companyId, userId } = await resolveScope(body);
+    await db.transaction(async tx => {
+      const [account] = await tx.select({ connection: toolConnections, grant: connectionGrants }).from(toolConnections)
+        .innerJoin(connectionGrants, and(eq(connectionGrants.companyId, companyId),
+          eq(connectionGrants.connectionId, toolConnections.id), eq(connectionGrants.kind, "user"),
+          eq(connectionGrants.subjectUserId, userId)))
+        .where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.id, body.connectionId),
+          eq(toolConnections.connectionPurpose, "ai"))).for("update");
+      const metadata = aiConnectionMetadataSchema.safeParse(account?.connection.config.ai);
+      if (!account || !metadata.success || metadata.data.provider !== body.provider || metadata.data.routing)
+        throw notFound("Personal connection not found");
+      if (account.grant.status === "revoked") return;
+      const revokedAt = new Date();
+      await tx.update(connectionGrants).set({ status: "revoked", revokedAt, updatedAt: revokedAt })
+        .where(and(eq(connectionGrants.companyId, companyId), eq(connectionGrants.id, account.grant.id)));
+      await logActivity(tx as unknown as Db, { companyId, actorType: "user", actorId: userId,
+        action: "untzr.ai_connection_disconnected", entityType: "connection_grant", entityId: account.grant.id });
+    });
+    res.json({ disconnected: true });
+  });
+
+  function codexEnabled() {
+    return process.env.PAPERCLIP_UNTZR_CODEX_LOGIN === "enabled" && supportsLocalAiLogin(options);
+  }
+  function requireCodex() {
+    if (!codexEnabled()) throw unprocessable("Codex sign-in is unavailable for this deployment. Use an OpenAI API key.");
+  }
+  function resolveScope(body: z.infer<typeof context>) {
+    return resolveUntzrScope(db, body.subject, body.companyId, body.projectId);
+  }
+  function loginScope(body: z.infer<typeof login>, userId: string) {
+    return createHash("sha256").update(JSON.stringify([
+      body.subject, body.companyId, body.projectId, userId, body.connectionId ?? null,
+    ])).digest("hex");
+  }
+  const loginIntent = (connectionId?: string) => ({
+    provider: "openai" as const, method: "subscription" as const, name: "Untzr Codex",
+    ownership: "personal" as const, agentIds: [], allAgents: false, connectionId,
+  });
+  router.post("/codex/start", validate(login.omit({ attempt: true })), async (req, res) => {
+    requireCodex();
+    const body = login.omit({ attempt: true }).parse(req.body);
+    const { companyId, userId } = await resolveScope(body);
+    const attempt = await local.start(companyId, userId, loginIntent(body.connectionId),
+      false, undefined, loginScope(body, userId));
+    res.status(201).json({ attempt: attempt.sessionId, expiresAt: attempt.expiresAt });
+  });
+  for (const command of ["status", "complete", "cancel"] as const) {
+    router.post(`/codex/${command}`, validate(login.required({ attempt: true })), async (req, res) => {
+      requireCodex();
+      const body = login.required({ attempt: true }).parse(req.body);
+      const { companyId, userId } = await resolveScope(body);
+      const id = body.attempt;
+      const [session] = await db.select({ id: adapterAuthSessions.id }).from(adapterAuthSessions)
+        .where(and(eq(adapterAuthSessions.id, id), eq(adapterAuthSessions.companyId, companyId),
+          eq(adapterAuthSessions.startedByUserId, userId), eq(adapterAuthSessions.integrationScope, loginScope(body, userId))));
+      if (!session) throw forbidden("The Codex sign-in attempt is outside this request's scope");
+      const intent = loginIntent(body.connectionId);
+      const scope = loginScope(body, userId);
+      if (command === "complete") {
+        res.status(201).json(await local.complete(companyId, userId, id, intent, undefined, scope));
+      } else if (command === "cancel") {
+        await local.cancel(companyId, userId, id, undefined, scope);
+        res.json({ cancelled: true });
+      } else {
+        const result = await local.check(companyId, userId, intent, id, scope);
+        if (result.status !== "sign_in_required") {
+          res.json({ status: result.status });
+          return;
+        }
+        const authorizationUrl = result.authorizationUrl && new URL(result.authorizationUrl);
+        if (authorizationUrl && (authorizationUrl.origin !== "https://auth.openai.com" ||
+            authorizationUrl.username || authorizationUrl.password)) throw unprocessable("Invalid Codex sign-in destination");
+        res.json({ status: result.status, authorizationUrl: authorizationUrl || undefined, code: result.code });
+      }
+    });
+  }
+
+  router.post("/launch", validate(launch), async (req, res) => {
+    const body = launch.parse(req.body);
+    const { agentIds, ...scope } = await resolveScope(body);
+    const companyId = scope.companyId;
+    if (!agentIds.includes(body.agentId)) throw forbidden("The selected agent is outside the approved Untzr scope");
+    const approvedAgents = await db.select().from(agents)
+      .where(and(eq(agents.companyId, companyId), inArray(agents.id, agentIds)));
+    const harness = body.provider === "openai" ? "codex_local" : "claude_local";
+    const stageAgents = approvedAgents.filter(agent => agent.adapterType === "paperclip_runner" &&
+      agentHarnessType(agent.adapterType, agent.adapterConfig) === harness);
+    if (!stageAgents.some(agent => agent.id === body.agentId))
+      throw forbidden("The selected agent cannot run this Untzr provider");
+    const [grant] = await db.select({ config: toolConnections.config }).from(toolConnections)
+      .innerJoin(connectionGrants, and(eq(connectionGrants.companyId, companyId),
+        eq(connectionGrants.connectionId, toolConnections.id), eq(connectionGrants.id, body.grantId),
+        eq(connectionGrants.subjectUserId, scope.userId), eq(connectionGrants.kind, "user")))
+      .where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.id, body.connectionId),
+        eq(toolConnections.connectionPurpose, "ai")));
+    const metadata = aiConnectionMetadataSchema.safeParse(grant?.config.ai);
+    if (!metadata.success || metadata.data.provider !== body.provider) throw forbidden("Choose an approved personal AI connection");
+    const parsed = untzrExecutionSchema.safeParse({ ...scope, provider: body.provider, method: metadata.data.method,
+      connectionId: body.connectionId, grantId: body.grantId, stageAgents: Object.fromEntries(stageAgents.map(agent => [
+        agent.id, { adapter: agent.adapterType, harness: agentHarnessType(agent.adapterType, agent.adapterConfig) },
+      ])), });
+    if (!parsed.success) throw forbidden("The approved Untzr agents or connection method are incompatible");
+    const execution = parsed.data;
+    for (const agent of stageAgents) {
+      await assertUntzrExecution(db, execution, { ...scope, agentId: agent.id, adapter: agent.adapterType, config: agent.adapterConfig });
+    }
+    const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+    const handoffId = `untzr:${digest([scope.subject, scope.projectId, body.requestId])}`;
+    const fingerprint = digest(body);
+    const issue = await db.transaction(async tx => {
+      let reused = false;
+      const row = await issueService(db).create(companyId, {
+        projectId: scope.projectId, projectWorkspaceId: scope.workspaceId, assigneeAgentId: body.agentId,
+        responsibleUserId: scope.userId, trustExplicitResponsibleUserId: true, createdByUserId: scope.userId,
+        title: body.title, description: body.description, status: "todo", untzrExecution: execution,
+        workspaceSelection: { kind: "configured_source", projectWorkspaceId: scope.workspaceId, mode: "managed_isolated" },
+        workspaceSelectionActor: { type: "board", source: "session", userId: scope.userId, isInstanceAdmin: false },
+        idempotencyKey: handoffId, originFingerprint: fingerprint, onDeduplicated: () => { reused = true; },
+        assertCanReuseIssue: async item => {
+          if (item.originFingerprint !== fingerprint || !item.untzrExecution ||
+              item.untzrExecution.grantId !== body.grantId) throw conflict("This Untzr request ID already identifies another handoff");
+        },
+      }, tx);
+      if (!reused) await logActivity(tx as unknown as Db, { companyId, actorType: "user", actorId: scope.userId,
+        action: "untzr.handoff_created", entityType: "issue", entityId: row.id,
+        details: { projectId: scope.projectId, repository: scope.repository, connectionId: body.connectionId } });
+      return row;
+    });
+    await heartbeat.wakeup(body.agentId, { source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+      payload: { issueId: issue.id }, contextSnapshot: { issueId: issue.id }, idempotencyKey: handoffId,
+      requestedByActorType: "user", requestedByActorId: scope.userId });
+    res.status(202).json({ issueId: issue.id, identifier: issue.identifier });
+  });
+  return router;
+}
